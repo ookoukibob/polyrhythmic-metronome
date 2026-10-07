@@ -46,10 +46,6 @@ Capacitor for Android and Electron for Windows.
 - **Offline** — no server, no analytics, no network calls. Works from a local
   file or any static host.
 
-## Screenshots
-
-None yet — screenshots will be added here once the mobile layout is settled.
-
 ## Running it
 
 ### Web
