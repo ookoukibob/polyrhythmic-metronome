@@ -34,34 +34,6 @@
     "@capacitor/cli": "^7.0.1",
     "@capacitor/core": "^7.0.1",
     "@electron/packager": "^20.3.0",
-    "electron": "^35.0.0",
-    "electron-builder": "^25.1.8"
-  },
-  "build": {
-    "appId": "com.polyrhythm.metronome",
-    "productName": "Polyrhythmic Metronome",
-    "directories": {
-      "output": "release"
-    },
-    "files": [
-      "index.html",
-      "style.css",
-      "app.js",
-      "electron/**/*",
-      "assets/**/*"
-    ],
-    "win": {
-      "target": [
-        "nsis",
-        "portable"
-      ],
-      "icon": "assets/icon.ico"
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
-    }
+    "electron": "^35.0.0"
   }
 }

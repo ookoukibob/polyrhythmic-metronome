@@ -7,7 +7,7 @@ node_modules/
 # Generated / packaged output (recreate with npm scripts)
 # ==========================================================================
 # www/            -> npm run prepare:cap   (copies index.html/style.css/app.js)
-# release/        -> npm run build:win     (electron-packager / electron-builder)
+# release/        -> npm run build:win     (electron-packager)
 www/
 release/
 dist/
