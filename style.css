@@ -1075,6 +1075,11 @@ img, svg, video, canvas {
 
   body {
     overflow-x: hidden;
+    /* `clip` does not create a scroll container (and does not force
+       overflow-y to `auto`), so the sticky transport bar always resolves
+       its scrollport against the viewport. Older engines ignore this line
+       and fall back to `hidden` above. */
+    overflow-x: clip;
     -webkit-tap-highlight-color: transparent;
     line-height: 1.45;
   }
