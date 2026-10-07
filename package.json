@@ -19,8 +19,7 @@
     "music",
     "web-audio"
   ],
-  "author": "Metronome Dev",
-  "license": "MIT",
+  "author": "OokoukiBob",
   "devDependencies": {
     "@capacitor/android": "^7.0.1",
     "@capacitor/cli": "^7.0.1",
