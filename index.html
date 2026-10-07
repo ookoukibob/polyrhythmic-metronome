@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#12141a">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Polyrhythmic Metronome — 高级多节拍/奇数拍节拍器</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- App Header -->
+  <header class="app-header">
+    <div class="brand">
+      <div class="brand-icon">⬡</div>
+      <div class="brand-titles">
+        <h1>ADVANCED POLYRHYTHMIC METRONOME</h1>
+        <p>Arbitrary Meters · Custom Groupings · Look-Ahead Engine</p>
+      </div>
+    </div>
+    <div class="header-actions">
+      <button id="add-layer-btn" class="btn btn-primary" title="添加独立节拍层">
+        <span>+ 新增 Layer</span>
+      </button>
+      <button id="share-btn" class="btn" title="将当前设置生成分享链接">
+        <span>🔗 分享配置</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Master Transport Bar -->
+  <section class="transport-bar">
+    <div class="transport-controls">
+      <button id="play-btn" class="transport-btn play-btn" title="播放 / 继续 (Space)">
+        <span id="play-icon">▶</span>
+      </button>
+      <button id="pause-btn" class="transport-btn pause-btn" title="暂停 (Space)">
+        <span>⏸</span>
+      </button>
+      <button id="stop-btn" class="transport-btn stop-btn" title="停止并重置到开头">
+        <span>■</span>
+      </button>
+      <button id="reset-btn" class="transport-btn" title="重置位置">
+        <span>↻</span>
+      </button>
+    </div>
+
+    <!-- Master Tempo Section -->
+    <div class="bpm-container">
+      <div>
+        <div class="bpm-label">TEMPO (BPM)</div>
+        <div class="bpm-value-wrap">
+          <input type="number" id="bpm-input" class="bpm-input" min="20" max="600" value="140">
+        </div>
+      </div>
+
+      <div class="bpm-steppers">
+        <div class="step-btn-group">
+          <button class="step-btn" data-step="-5">-5</button>
+          <button class="step-btn" data-step="-1">-1</button>
+          <button class="step-btn" data-step="1">+1</button>
+          <button class="step-btn" data-step="5">+5</button>
+        </div>
+        <input type="range" id="bpm-slider" class="bpm-slider" min="20" max="400" value="140" style="accent-color: var(--accent-cyan); cursor: pointer;">
+      </div>
+
+      <button id="tap-btn" class="tap-btn">TAP TEMPO</button>
+    </div>
+
+    <div class="master-extras">
+      <div class="shortcut-badge">Space = 播放/暂停</div>
+    </div>
+  </section>
+
+  <!-- Main Workspace -->
+  <main class="workspace">
+    <div class="layers-header">
+      <h2>节拍层 (Rhythm Layers & Polyrhythm)</h2>
+    </div>
+
+    <!-- Dynamic Layers List -->
+    <div id="layers-list" class="layers-list">
+      <!-- Layers injected by JavaScript -->
+    </div>
+
+    <!-- Presets Section -->
+    <section class="presets-section">
+      <div class="presets-header">
+        <h3>预设管理 (Presets & Examples)</h3>
+        <div class="preset-input-wrap">
+          <input type="text" id="preset-name-input" class="preset-name-input" placeholder="输入预设名称 (如: 59/16 练习)">
+          <button id="save-preset-btn" class="btn btn-primary btn-sm">保存当前预设</button>
+        </div>
+      </div>
+
+      <!-- Factory Presets Buttons -->
+      <div style="display: flex; flex-direction: column; gap: 8px;">
+        <span style="font-size: 11px; color: var(--text-muted); font-weight: 700; text-transform: uppercase;">经典与实验性推荐拍号:</span>
+        <div id="factory-presets" class="presets-chips">
+          <!-- Populated by JS -->
+        </div>
+      </div>
+
+      <!-- User Presets Container -->
+      <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 6px;">
+        <span style="font-size: 11px; color: var(--text-muted); font-weight: 700; text-transform: uppercase;">已保存的用户预设 (本地持久化):</span>
+        <div id="user-presets" class="presets-chips">
+          <!-- Populated by JS -->
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- App Footer -->
+  <footer class="app-footer">
+    <div>Advanced Polyrhythmic Metronome · 纯静态 Web Audio API 运行 · 无任何服务器依赖</div>
+    <div>低延迟高精度调度器 (Web Audio Look-Ahead)</div>
+  </footer>
+
+  <!-- Toast Notification -->
+  <div id="toast" class="toast">已复制分享链接到剪贴板！</div>
+
+  <script src="app.js"></script>
+</body>
+</html>

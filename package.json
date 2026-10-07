@@ -1,0 +1,59 @@
+{
+  "name": "advanced-polyrhythmic-metronome",
+  "version": "1.0.0",
+  "description": "Professional Advanced Polyrhythmic Metronome with Arbitrary Meters and Custom Groupings",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "serve": "npx serve -l 3000 .",
+    "build:win": "electron-packager . \"Polyrhythmic Metronome\" --platform=win32 --arch=x64 --out=release --overwrite",
+    "prepare:cap": "node scripts/prepare-cap.js",
+    "cap:sync": "npm run prepare:cap && cap sync android",
+    "cap:open": "cap open android",
+    "build:android": "npm run prepare:cap && cap sync android && cd android && .\\gradlew.bat assembleDebug"
+  },
+  "keywords": [
+    "metronome",
+    "polyrhythm",
+    "odd-meter",
+    "music",
+    "web-audio"
+  ],
+  "author": "Metronome Dev",
+  "license": "MIT",
+  "devDependencies": {
+    "@capacitor/android": "^7.0.1",
+    "@capacitor/cli": "^7.0.1",
+    "@capacitor/core": "^7.0.1",
+    "@electron/packager": "^20.3.0",
+    "electron": "^35.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.polyrhythm.metronome",
+    "productName": "Polyrhythmic Metronome",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "index.html",
+      "style.css",
+      "app.js",
+      "electron/**/*",
+      "assets/**/*"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}

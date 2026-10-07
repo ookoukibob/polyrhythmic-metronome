@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0a0b0e"/>
+      <stop offset="100%" stop-color="#181b24"/>
+    </linearGradient>
+    <linearGradient id="beamGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00d2ff"/>
+      <stop offset="100%" stop-color="#ff5e36"/>
+    </linearGradient>
+  </defs>
+  <!-- Background Rounded Squircle -->
+  <rect x="16" y="16" width="480" height="480" rx="96" fill="url(#bgGrad)" stroke="#252a36" stroke-width="8"/>
+  
+  <!-- Metronome Body Pyramid -->
+  <polygon points="256,60 140,430 372,430" fill="none" stroke="#3a4256" stroke-width="12" stroke-linejoin="round"/>
+  
+  <!-- Center Scale Line -->
+  <line x1="256" y1="120" x2="256" y2="400" stroke="#252a36" stroke-width="6" stroke-dasharray="8 8"/>
+  
+  <!-- Pendulum Arm (Angled) -->
+  <line x1="256" y1="410" x2="330" y2="100" stroke="url(#beamGrad)" stroke-width="14" stroke-linecap="round"/>
+  
+  <!-- Sliding Weight Bob -->
+  <rect x="295" y="160" width="36" height="48" rx="8" fill="#ff5e36" stroke="#ffffff" stroke-width="4"/>
+  
+  <!-- Pivot Base -->
+  <circle cx="256" cy="410" r="16" fill="#00d2ff"/>
+
+  <!-- Rhythm Wave Indicator -->
+  <circle cx="340" cy="90" r="14" fill="#00d2ff" opacity="0.8"/>
+  <circle cx="340" cy="90" r="28" fill="none" stroke="#00d2ff" stroke-width="3" opacity="0.4"/>
+</svg>

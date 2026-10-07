@@ -1,0 +1,85 @@
+# ==========================================================================
+# Dependencies
+# ==========================================================================
+node_modules/
+
+# ==========================================================================
+# Generated / packaged output (recreate with npm scripts)
+# ==========================================================================
+# www/            -> npm run prepare:cap   (copies index.html/style.css/app.js)
+# release/        -> npm run build:win     (electron-packager / electron-builder)
+www/
+release/
+dist/
+dist-ssr/
+out/
+build/
+.tmp/
+*.local
+
+# ==========================================================================
+# Binary artifacts (APK / AAB / installers)
+# ==========================================================================
+*.apk
+*.aab
+*.ap_
+*.aar
+
+# ==========================================================================
+# Signing material — NEVER commit
+# ==========================================================================
+android/keystore/
+keystore/
+*.keystore
+*.jks
+*.p12
+*.pfx
+*.pem
+*.pem.*
+keystore.properties
+android/keystore.properties
+
+# Google / platform service credentials
+google-services.json
+GoogleService-Info.plist
+*.p8
+*.p12
+
+# ==========================================================================
+# Secrets & environment files
+# ==========================================================================
+.env
+.env.*
+!.env.example
+secrets.*
+*-secrets.*
+
+# Local build reports (contain signing details)
+apk/
+
+# ==========================================================================
+# Logs
+# ==========================================================================
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ==========================================================================
+# Editor directories and files
+# ==========================================================================
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.hprof
