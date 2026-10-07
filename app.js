@@ -1,5 +1,5 @@
 /**
- * Advanced Polyrhythmic Metronome
+ * Polyrhythmic Metronome
  * Pure Vanilla JavaScript + Web Audio API
  * Fully Standalone — No Server / Node Required
  */
@@ -410,7 +410,7 @@ class MetronomeApp {
         ]
       },
       {
-        name: '23/7 无理/罕见分数拍 (Irrational)',
+        name: '23/7 罕见分数拍 (Rare Fraction)',
         bpm: 120,
         layers: [
           {

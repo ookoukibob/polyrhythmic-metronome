@@ -1,12 +1,22 @@
 {
-  "name": "advanced-polyrhythmic-metronome",
+  "name": "polyrhythmic-metronome",
   "version": "1.0.0",
-  "description": "Professional Advanced Polyrhythmic Metronome with Arbitrary Meters and Custom Groupings",
+  "description": "A metronome for meters that shouldn't exist: arbitrary meters, custom grouping, accent patterns and polyrhythmic layers.",
   "main": "electron/main.js",
+  "license": "SEE LICENSE IN LICENSE",
+  "author": "OokoukiBob",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ookoukibob/polyrhythmic-metronome.git"
+  },
+  "homepage": "https://github.com/ookoukibob/polyrhythmic-metronome#readme",
+  "bugs": {
+    "url": "https://github.com/ookoukibob/polyrhythmic-metronome/issues"
+  },
   "scripts": {
     "start": "electron .",
     "serve": "npx serve -l 3000 .",
-    "build:win": "electron-packager . \"Polyrhythmic Metronome\" --platform=win32 --arch=x64 --out=release --overwrite",
+    "build:win": "electron-packager . \"Polyrhythmic Metronome\" --platform=win32 --arch=x64 --out=release --overwrite --ignore=\"^/android($|/)\" --ignore=\"^/apk($|/)\" --ignore=\"^/www($|/)\" --ignore=\"^/release($|/)\" --ignore=\"^/scripts($|/)\" --ignore=\"\\.keystore$\"",
     "prepare:cap": "node scripts/prepare-cap.js",
     "cap:sync": "npm run prepare:cap && cap sync android",
     "cap:open": "cap open android",
@@ -19,7 +29,6 @@
     "music",
     "web-audio"
   ],
-  "author": "OokoukiBob",
   "devDependencies": {
     "@capacitor/android": "^7.0.1",
     "@capacitor/cli": "^7.0.1",

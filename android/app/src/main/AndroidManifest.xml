@@ -38,6 +38,8 @@
 
     <!-- Permissions -->
 
-    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- This app is fully offline: every page is served from bundled assets via
+         Capacitor's WebViewLocalServer (shouldInterceptRequest), so no network
+         access is used. INTERNET is intentionally NOT declared. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 </manifest>

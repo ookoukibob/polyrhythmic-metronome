@@ -1,143 +1,156 @@
-# 高级多节拍/奇数拍节拍器 (Advanced Polyrhythmic Metronome)
+[English](README.md) · [简体中文](README.zh-CN.md)
 
-这是一个纯前端、跨平台的现代化高级节拍器，专为音乐人、贝斯手、鼓手与作曲者设计。
+# Polyrhythmic Metronome
 
-**统一跨平台架构 (Single Codebase)**：
-* **核心代码**：HTML5 + CSS3 + Vanilla JavaScript (与平台完全解耦，三端共享 100% 逻辑代码)
-* **音频引擎**：Web Audio API (Look-Ahead 前瞻调度器，sample-accurate 极低延迟，防抖动，离线合成)
-* **数据存储**：`localStorage` (纯本地持久化，无后端、无数据库、无网络依赖)
-* **三端发布体系**：
-  1. **Web 版本**：直接双击 `index.html` 或静态托管运行。
-  2. **Windows 桌面版 (`.exe`)**：基于 Electron 打包的独立桌面客户端。
-  3. **Android 移动版 (`.apk`)**：基于 Capacitor 打包的原生 Android 工程。
+> A metronome for meters that shouldn't exist.
+>
+> 59/16? 73/32? Why not.
 
----
+An offline metronome for practicing and composing in arbitrary time signatures.
+Type any meter you like — 7/8, 13/16, 23/7, 59/16 — split the bar into your own
+groups, mark accents and mutes, then stack several independent layers on top of
+each other.
 
-## 核心特性实现
+The app is plain HTML + CSS + vanilla JavaScript running on the Web Audio API.
+There is no backend, no framework and no build step: the same three files
+(`index.html`, `style.css`, `app.js`) ship on every platform, wrapped with
+Capacitor for Android and Electron for Windows.
 
-1. **标志性用例：59/16 奇数拍节拍器**
-   - 启动即默认载入 59/16 复合分组：`3+3+2+5+7+4+6+5+2+3+4+5+3+3+4 = 59`。
-   - 细分音符时长公式：`sixteenth duration = (4 / 16) * (60 / BPM) = 60 / BPM / 4`，精确计算每个十六分音符。
-   - 分组总和校验：实时校验分组之和是否等于分子，差值醒目警告。
+## Features
 
-2. **任意拍号支持 (Arbitrary Meters)**
-   - 分子支持任意正整数（如 4、7、13、17、41、59、73、137 等，支持至几百上千拍）。
-   - 分母支持任意正数（如常见的 4/8/16/32，亦支持 7、5、3 等无理/奇数细分）。
-   - 健壮的输入校验：杜绝 0、负数、NaN 等非法数值。
+- **Arbitrary meters** — numerator accepts 1–1024, denominator 1–256. Meters
+  such as 7/8, 11/16, 59/16 and 73/32 are all just numbers; nothing is
+  hard-coded to a list of "allowed" signatures.
+- **Custom grouping** — split the bar into groups (3+3+2+5+7…), edit any group
+  by hand, add, delete or reorder them, and get a live sum check against the
+  numerator. Quick actions: auto-group, even split, accent on group starts,
+  clear.
+- **Accent / Normal / Mute pattern** — click any subdivision cell to cycle
+  through ● accent, ○ normal and × muted. Reset to the group defaults, set
+  everything to normal, or generate a random pattern.
+- **Polyrhythmic layers** — run several meters at once (59/16 against 7/16
+  against 11/16). Each layer keeps its own meter, grouping, pattern and mute
+  state.
+- **Per-layer sound, volume and multiplier** — 5 synthesized tones (Classic
+  Click, Wood Block, Electronic, Soft Click, Cowbell), independent level and
+  accent level, plus a BPM multiplier from 0.1× to 8× for that layer.
+- **Web Audio look-ahead scheduling** — a 25 ms scheduler tick fills an 80 ms
+  look-ahead window, so every hit is placed on the audio clock instead of the
+  main thread timer.
+- **Tap tempo** — hit `TAP TEMPO` a few times to set the BPM.
+- **Local presets** — 7 factory presets (59/16, 59:7:11, 73/32, 23/7, 17/16,
+  7/8, 4/4) plus your own saved presets, stored in `localStorage`.
+- **Shareable configuration** — the whole state (BPM and every layer) is
+  encoded into the URL fragment, so a link reproduces the exact setup.
+- **Screen Wake Lock** — the screen stays on while the metronome is playing.
+- **Offline** — no server, no analytics, no network calls. Works from a local
+  file or any static host.
 
-3. **分组系统 (Grouping System)**
-   - 自动在各组第一个细分音符触发重音（Accent）。
-   - 提供「自动分组 (Auto Group)」、「平均分配 (Even)」、「组首重音」、「一键清空」。
-   - 支持新增组、删除组、直接输入数值，以及 **◀/▶ 快速调整分组顺序**。
+## Screenshots
 
-4. **交互式细分网格 (Subdivision Grid)**
-   - 完整显示 1..N 的细分单元格，点击循环切换三种状态：
-     - **● 重音 (Accent)**：明亮橙色高亮，增益放大
-     - **○ 普音 (Normal)**：清脆青色音
-     - **× 静音 (Mute)**：灰色静音，不触发音频事件
-   - 包含分组边界标识线，支持横向平滑滚动，并支持播放头自动居中视野跟踪。
-   - 提供 Pattern 操作：重置为默认分组、全部普音、随机节奏型。
+None yet — screenshots will be added here once the mobile layout is settled.
 
-5. **多层复节奏 (Multi-Layer Polyrhythm)**
-   - 支持同时播放多层独立节奏（如 `59/16` vs `7/16` vs `11/16`）。
-   - 每层独立拥有：拍号 (分子/分母)、BPM 独立倍率、音色、音量、重音增益、静音及分组。
+## Running it
 
-6. **Web Audio 稳定调度器 (Look-Ahead Scheduling)**
-   - 采用 25ms 调度定时器结合 80ms 预调度窗口，在 Web Audio 线程精确触发音频节点。
-   - 5 种纯算法合成音色（无需外部音频文件，零体积零加载）：
-     - Classic Click (经典下潜正弦波)
-     - Wood Block (共鸣滤波木鱼音)
-     - Electronic (穿透性电子方波)
-     - Soft Click (温和正弦音)
-     - Cowbell 🐄 (双失谐金属方波)
+### Web
 
-7. **Transport 控制与练琴实用工具**
-   - ▶ 播放 / ⏸ 暂停 / ■ 停止 / ↻ 重置。
-   - 空格键 (Space) 全局播放/暂停快捷键。
-   - BPM 控制：20–600（支持数字输入、滑块、+/-1、+/-5 微调）。
-   - **Tap Tempo** 测速器。
-   - **屏幕常亮保护 (Screen Wake Lock)**：播放期间自动保持设备屏幕常亮，防止手机/电脑休眠中断练习。
+Open `index.html` directly in a browser, or serve the folder:
 
-8. **预设管理与 URL 分享**
-   - 包含 7 种经典/实验性内置预设（59/16、59:7:11、73/32、23/7、17/16 等）。
-   - 本地 `localStorage` 自定义预设存取。
-   - URL Hash 编码：一键复制完整配置的分享链接。
-
----
-
-## 平台运行与打包指南
-
-### 1. Web 版本运行
-
-直接使用浏览器打开，完全离线可用：
 ```bash
-# 方式 A：直接双击打开 index.html 即可运行
-# 方式 B：如需本地静态服务器调试
-npm run serve
+npm run serve    # http://localhost:3000
 ```
-访问 `http://localhost:3000` 即可。
 
----
+No dependencies are needed just to run it; `npm install` is only required for
+packaging (Android / Windows).
 
-### 2. Windows 桌面版 (`.exe`)
+### Android
 
-#### 直接运行已打包好的客户端：
-已编译生成的 Windows 独立可执行程序位于：
-```
-release\Polyrhythmic Metronome-win32-x64\Polyrhythmic Metronome.exe
-```
-直接双击即可运行，绿色免安装。
+Requirements: JDK 21 and an Android SDK with platform 35 and build-tools
+(Android Studio installs both).
 
-#### 开发运行与重新打包：
 ```bash
-# 启动桌面开发调试
-npm start
+npm install
+npm run cap:sync                 # copy web assets into android/app/src/main/assets/public
 
-# 重新打包 Windows 绿色版 .exe
-npm run build:win
+cd android
+gradlew assembleDebug            # ./gradlew assembleDebug on macOS/Linux
 ```
-输出目录为 `release/Polyrhythmic Metronome-win32-x64/`。
 
----
+The APK lands in `android/app/build/outputs/apk/debug/app-debug.apk`, signed
+with the debug key, ready to install with `adb install`.
 
-### 3. Android 移动版 (`.apk`)
+For a release build (`gradlew assembleRelease`) Gradle reads the signing
+config from `android/keystore.properties`, which is intentionally gitignored.
+Create your own keystore and point the file at it:
 
-项目已完整初始化 Capacitor Android 工程（位于 `android/` 目录），配置了 `AndroidManifest.xml`、WAKE_LOCK 权限和 WebView 同步：
+```properties
+storeFile=../keystore/release.keystore
+storePassword=...
+keyAlias=...
+keyPassword=...
+```
 
-#### 同步最新前端代码至 Android 工程：
+The application id is `com.polyrhythm.metronome`. The app declares only the
+`WAKE_LOCK` permission: it serves its own assets from the WebView and makes no
+network requests, so `INTERNET` is deliberately not requested.
+
+To update the app after changing the web files, re-run `npm run cap:sync`
+before building.
+
+### Windows
+
 ```bash
-npm run cap:sync
+npm install
+npm start           # run the Electron app for development
+npm run build:win   # package a portable build
 ```
 
-#### 在 Android Studio 中打开并构建 APK：
-```bash
-npm run cap:open
-```
-在 Android Studio 中点击 **Build > Build Bundle(s) / APK(s) > Build APK(s)**，即可生成 `.apk` 文件。
+`build:win` uses `electron-packager` and writes
+`release/Polyrhythmic Metronome-win32-x64/Polyrhythmic Metronome.exe`, which
+runs without installation.
 
-#### 命令行直接构建 Debug APK（需配置本地 Android SDK）：
-```bash
-npm run build:android
-```
-生成的 APK 位于 `android/app/build/outputs/apk/debug/app-debug.apk`。
+## Sharing a configuration
 
----
+Press **分享配置** in the header. The current BPM and all layers (meter, grouping,
+pattern, sound, volumes, multiplier, mute) are serialized to JSON, base64-encoded
+into the URL fragment and copied to the clipboard. Opening that URL restores the
+same setup. Nothing is sent anywhere — decoding happens in the browser.
 
-## 项目结构
+## Project layout
 
 ```
-advanced-metronome/
-├── index.html            # 统一前端入口 (Web / Electron / Capacitor 共享)
-├── style.css             # 专业 DAW 暗黑主题样式与移动端适配
-├── app.js                # 节拍器全量核心逻辑 (Web Audio、Rhythm、State、UI)
-├── package.json          # 构建脚本与多平台配置
-├── capacitor.config.json # Capacitor Android 配置文件
+polyrhythmic-metronome/
+├── index.html            # entry point, shared by web / Electron / Capacitor
+├── style.css             # DAW-style dark theme + responsive rules
+├── app.js                # state, rhythm model, Web Audio scheduler, UI
+├── package.json          # scripts and packaging metadata
+├── capacitor.config.json # Capacitor Android configuration
 ├── scripts/
-│   └── prepare-cap.js    # 将前端文件同步至 Capacitor www 目录的脚本
+│   └── prepare-cap.js    # copies the web assets into www/
 ├── electron/
-│   └── main.js           # Electron 桌面主进程 (纯本地加载 index.html)
-├── release/              # Windows .exe 打包产物目录
-│   └── Polyrhythmic Metronome-win32-x64/
-│       └── Polyrhythmic Metronome.exe
-└── android/              # 原生 Android Capacitor 工程
+│   └── main.js           # Electron main process
+├── android/              # Capacitor Android project (Gradle)
+├── assets/               # icon (svg)
+└── LICENSE
 ```
+
+`www/`, `release/`, `build/` and `dist/` are generated and gitignored.
+
+## License
+
+Polyrhythmic Metronome is released under the
+**Polyrhythmic Metronome Source-Available Non-Commercial License** — see
+[LICENSE](LICENSE).
+
+It is *not* an OSI-approved open source license. You may view, run, study,
+modify and share the code for personal, educational, research and other
+non-commercial purposes. Commercial use requires permission from the copyright
+holder. Copyright (c) 2026 OokoukiBob.
+
+## Contributing
+
+Issues and pull requests are welcome at
+[ookoukibob/polyrhythmic-metronome](https://github.com/ookoukibob/polyrhythmic-metronome),
+especially for bug fixes and platform packaging problems. Please keep changes
+focused, and note that contributions are accepted under the same non-commercial
+license (see the contribution section of [LICENSE](LICENSE)).
