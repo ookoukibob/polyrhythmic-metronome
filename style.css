@@ -169,6 +169,22 @@ button, .subdiv-cell, .tap-btn, .step-btn {
   gap: 20px;
 }
 
+/* Core transport controls (Play/Pause/Stop/Reset) stay reachable while the
+   page auto-scrolls the playhead into view — on mobile and desktop.
+   `top: 60px` sits just under the ~65px sticky app header: the bar tucks a
+   few px beneath it (same opaque background) instead of leaving a gap.
+   BPM lives in the sibling .bpm-bar and keeps scrolling with the page. */
+.transport-controls-bar {
+  position: sticky;
+  top: 60px;
+  z-index: 90;
+}
+
+/* Keep the BPM card on the right, where it sits in the original single bar */
+.bpm-bar {
+  justify-content: flex-end;
+}
+
 .transport-controls {
   display: flex;
   align-items: center;
@@ -1126,6 +1142,11 @@ img, svg, video, canvas {
     padding: 12px;
   }
 
+  /* Header scrolls away on mobile, so the pinned controls start at the top */
+  .transport-controls-bar {
+    top: 0;
+  }
+
   .transport-controls {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
@@ -1623,6 +1644,11 @@ img, svg, video, canvas {
     flex-direction: row;
     align-items: center;
     padding: 8px 12px;
+  }
+
+  /* Header scrolls away in short viewports too — pin controls at the top */
+  .transport-controls-bar {
+    top: 0;
   }
 
   .brand-titles p {

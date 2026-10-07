@@ -30,8 +30,8 @@
     </div>
   </header>
 
-  <!-- Master Transport Bar -->
-  <section class="transport-bar">
+  <!-- Master Transport Bar (sticky core transport controls) -->
+  <section class="transport-bar transport-controls-bar">
     <div class="transport-controls">
       <button id="play-btn" class="transport-btn play-btn" title="播放 / 继续 (Space)">
         <span id="play-icon">▶</span>
@@ -46,8 +46,10 @@
         <span>↻</span>
       </button>
     </div>
+  </section>
 
-    <!-- Master Tempo Section -->
+  <!-- Master Tempo Section (normal flow, scrolls with the page) -->
+  <section class="transport-bar bpm-bar">
     <div class="bpm-container">
       <div>
         <div class="bpm-label">TEMPO (BPM)</div>
