@@ -1,0 +1,141 @@
+Polyrhythmic Metronome Source-Available Non-Commercial License
+
+Copyright (c) 2026 OokoukiBob
+
+All rights reserved except as expressly granted below.
+
+1. Purpose
+
+This software is made publicly available in source-code form for transparency, learning, experimentation, personal use, educational use, research, and non-commercial collaboration.
+
+This License does not constitute an Open Source license and does not grant general permission to use this software for commercial purposes.
+
+2. Permission to Use
+
+Subject to the terms of this License, the copyright holder grants you a non-exclusive, worldwide, royalty-free license to:
+
+- view and inspect the source code;
+- download and run the software for personal, educational, research, or other non-commercial purposes;
+- modify the source code for personal or non-commercial purposes;
+- create private derivative works for non-commercial purposes;
+- contribute modifications to the original project.
+
+3. Non-Commercial Restriction
+
+You may not use the software, source code, or a derivative work for a Commercial Purpose without prior written permission from the copyright holder.
+
+"Commercial Purpose" includes, but is not limited to:
+
+- selling the software or a derivative work;
+- charging users for access to the software or a derivative work;
+- incorporating the software into a product or service offered for payment;
+- using the software as part of a commercial service;
+- using the software primarily to generate advertising, subscription, licensing, sponsorship, or other commercial revenue;
+- distributing the software as part of a paid product or commercial software bundle;
+- using the software or a derivative work to provide a paid service to third parties.
+
+A voluntary donation made by a user to support the original Polyrhythmic Metronome project or its copyright holder does not, by itself, constitute commercial use of the software.
+
+4. Distribution of Modified Versions
+
+You may distribute a modified version of the software only for non-commercial purposes and only if all of the following conditions are satisfied:
+
+1. The modified version clearly states that it is modified from the Polyrhythmic Metronome project.
+2. The original copyright notice is retained.
+3. A copy of this License is included.
+4. You do not represent the modified version as an official release of Polyrhythmic Metronome.
+5. You do not use the Polyrhythmic Metronome name, logo, trademarks, or other branding in a manner that implies official endorsement or affiliation.
+6. The distribution is not made for a Commercial Purpose.
+
+You may not distribute a modified version under terms that grant recipients broader rights than those granted by this License.
+
+5. Unmodified Distribution
+
+You may redistribute an unmodified copy of the software for non-commercial purposes, provided that:
+
+- the original copyright notice is retained;
+- this License is included;
+- no additional restrictions are imposed on the rights granted by this License; and
+- the distribution is not made for a Commercial Purpose.
+
+6. Name, Logo, and Branding
+
+This License does not grant any rights to the project's name, logo, trademarks, service marks, domain names, visual identity, or other branding.
+
+The name:
+
+Polyrhythmic Metronome
+
+and any associated logos, icons, visual identity, and branding remain the property of the copyright holder unless separately stated otherwise.
+
+A fork or derivative work must not use the name "Polyrhythmic Metronome" in a manner that implies that the fork is the official project.
+
+The copyright holder may separately register or otherwise protect the Polyrhythmic Metronome name and branding as trademarks or other applicable intellectual property.
+
+7. Copyright
+
+The source code and other copyrightable materials in this project remain the property of their respective copyright holders.
+
+Unless otherwise stated in individual files, the original portions of this project are:
+
+Copyright © 2026 OokoukiBob
+
+This License does not transfer ownership of any copyright to you.
+
+8. Third-Party Components
+
+This License applies only to material owned by Polyrhythmic Metronome.
+
+Third-party libraries, frameworks, assets, fonts, sounds, icons, and other components included in or used by the project remain subject to their respective licenses.
+
+Nothing in this License is intended to override or restrict rights granted by applicable third-party licenses.
+
+Where required, the applicable third-party license notices shall be retained and provided with the software.
+
+9. Contributions
+
+Unless a separate written agreement states otherwise, by submitting a contribution to this project, you represent that you have the legal right to submit the contribution and that the contribution may be distributed as part of the project under the terms of this License.
+
+Contributors retain copyright in their own contributions unless they expressly transfer that copyright.
+
+By submitting a contribution, you grant Polyrhythmic Metronome a non-exclusive, worldwide, royalty-free license to use, reproduce, modify, incorporate, distribute, and sublicense that contribution as part of the project, subject to applicable law.
+
+10. Commercial Licensing
+
+The copyright holder may grant separate commercial licenses at its sole discretion.
+
+If you wish to use the software, source code, or a derivative work for a Commercial Purpose, you may contact OokoukiBob to request a commercial license.
+
+A commercial license may include additional rights, permissions, fees, or conditions.
+
+Nothing in this License requires the copyright holder to grant a commercial license.
+
+11. No Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, OR NON-INFRINGEMENT.
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, POLYRHYTHMIC METRONOME AND ITS COPYRIGHT HOLDERS AND CONTRIBUTORS SHALL NOT BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+12. Termination
+
+Any rights granted under this License terminate automatically if you materially violate its terms.
+
+Upon termination, you must cease exercising the rights granted by this License, except to the extent that applicable law provides otherwise.
+
+Termination does not affect rights that were validly exercised before the violation, where such rights cannot lawfully be revoked.
+
+13. Governing Law
+
+This License shall be interpreted in accordance with applicable law.
+
+If any provision of this License is found to be unenforceable, the remaining provisions shall remain in effect to the maximum extent permitted by applicable law.
+
+14. Acceptance
+
+By using, modifying, or distributing the software under the permissions granted above, you agree to be bound by the terms of this License.
+
+---
+
+Copyright © 2026 OokoukiBob.
+
+All rights reserved except as expressly permitted by this License.
