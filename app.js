@@ -655,18 +655,29 @@ class MetronomeApp {
 
     // Highlight current cell
     const cell = layerEl.querySelector(`.subdiv-cell[data-index="${subdivIndex}"]`);
-    if (cell) {
-      cell.classList.add('active-playhead');
+    if (!cell) return;
+    cell.classList.add('active-playhead');
 
-      // Auto-scroll inside horizontal scroll wrapper if cell is outside visible area
-      const scrollWrap = layerEl.querySelector('.subdivision-scroll-wrap');
-      if (scrollWrap) {
-        const wrapRect = scrollWrap.getBoundingClientRect();
-        const cellRect = cell.getBoundingClientRect();
-        if (cellRect.left < wrapRect.left || cellRect.right > wrapRect.right) {
-          cell.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' });
-        }
-      }
+    // Horizontal auto-follow: adjust ONLY this layer's own scroll wrapper by
+    // setting its scrollLeft directly. Never uses scrollIntoView or any API
+    // that could scroll the page. Follows only when the cell leaves the
+    // wrapper's visible content box, and by the minimum distance needed —
+    // so a user's manual horizontal position is not reset every beat.
+    const wrap = layerEl.querySelector('.subdivision-scroll-wrap');
+    if (!wrap) return;
+    const wrapRect = wrap.getBoundingClientRect();
+    const cellRect = cell.getBoundingClientRect();
+    const cs = getComputedStyle(wrap);
+    const leftEdge = wrapRect.left + (parseFloat(cs.paddingLeft) || 0);
+    const rightEdge = wrapRect.right - (parseFloat(cs.paddingRight) || 0);
+    let delta = 0;
+    if (cellRect.left < leftEdge) {
+      delta = cellRect.left - leftEdge;
+    } else if (cellRect.right > rightEdge) {
+      delta = cellRect.right - rightEdge;
+    }
+    if (delta !== 0) {
+      wrap.scrollLeft += delta;
     }
   }
 
