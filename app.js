@@ -5,6 +5,113 @@
  */
 
 // ============================================================================
+// 0. Shared Configuration Constraints
+// ============================================================================
+// Single source of truth for every value that can arrive from the UI, a
+// shared URL hash or a saved preset. Both import paths run through
+// MetronomeState.normalizeConfiguration(), so neither can bypass these limits.
+
+const METRONOME_LIMITS = Object.freeze({
+  bpm: { min: 20, max: 600 },
+  numerator: { min: 1, max: 1024 },
+  denominator: { min: 1, max: 256 },
+  bpmMultiplier: { min: 0.1, max: 8 },
+  volume: { min: 0, max: 1 },
+  accentVolume: { min: 0.5, max: 2 },
+  groupSize: { min: 1, max: 512 },
+  maxLayers: 64,
+  maxGroupEntries: 1024,
+  maxOverrides: 1024,
+  maxNameLength: 200,
+  maxPayloadLength: 200000,
+});
+
+const METRONOME_SOUNDS = ['classic', 'wood', 'electronic', 'soft', 'cowbell'];
+const METRONOME_BEAT_TYPES = ['accent', 'normal', 'mute'];
+
+// Accept JSON numbers and numeric strings; reject NaN, Infinity and junk.
+function toFiniteNumber(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+// Numeric but out of range is clamped, exactly like the UI inputs do.
+// Non-numeric / non-finite values fall back instead of reaching the scheduler.
+function clampNumber(value, range, fallback) {
+  const n = toFiniteNumber(value);
+  if (n === null) return fallback;
+  return Math.min(range.max, Math.max(range.min, n));
+}
+
+function clampInt(value, range, fallback) {
+  const n = toFiniteNumber(value);
+  if (n === null) return fallback;
+  return Math.min(range.max, Math.max(range.min, Math.round(n)));
+}
+
+function normalizeName(value, fallback) {
+  if (typeof value !== 'string') return fallback;
+  const trimmed = value.trim().slice(0, METRONOME_LIMITS.maxNameLength);
+  return trimmed || fallback;
+}
+
+// Grouping is validated structurally only. Its SUM is deliberately NOT
+// validated here: the UI allows temporarily incomplete groupings (Clear
+// Grouping) and reports the mismatch as a warning, so that stays editable.
+// Returns a fresh array, or null when the structure itself is unusable.
+function normalizeGroups(raw, fallbackGroups) {
+  if (raw === undefined || raw === null) {
+    return Array.isArray(fallbackGroups) ? [...fallbackGroups] : null;
+  }
+  if (!Array.isArray(raw) || raw.length > METRONOME_LIMITS.maxGroupEntries) return null;
+
+  const groups = [];
+  for (const entry of raw) {
+    const n = toFiniteNumber(entry);
+    if (n === null || !Number.isInteger(n)) return null;
+    if (n < METRONOME_LIMITS.groupSize.min || n > METRONOME_LIMITS.groupSize.max) return null;
+    groups.push(n);
+  }
+  return groups;
+}
+
+// Overrides: { [subdivIndex]: 'accent'|'normal'|'mute' } or [[index, type], ...].
+// Entries whose index is outside this layer's subdivision range, or whose beat
+// type is unknown, are dropped — an override is optional, so dropping it falls
+// back to the grouping-derived default rather than corrupting the pattern.
+// Returns a fresh object, or null when the container structure is unusable.
+function normalizeOverrides(raw, numerator) {
+  if (raw === undefined || raw === null) return {};
+
+  let entries;
+  if (Array.isArray(raw)) {
+    if (raw.length > METRONOME_LIMITS.maxOverrides) return null;
+    entries = raw;
+  } else if (typeof raw === 'object') {
+    entries = Object.entries(raw);
+    if (entries.length > METRONOME_LIMITS.maxOverrides) return null;
+  } else {
+    return null;
+  }
+
+  const overrides = {};
+  for (const entry of entries) {
+    if (!Array.isArray(entry) || entry.length < 2) continue;
+    const index = toFiniteNumber(entry[0]);
+    const type = entry[1];
+    if (index === null || !Number.isInteger(index)) continue;
+    if (index < 0 || index >= numerator) continue;
+    if (!METRONOME_BEAT_TYPES.includes(type)) continue;
+    overrides[index] = type;
+  }
+  return overrides;
+}
+
+// ============================================================================
 // 1. Audio Engine & Sound Synthesizer (Look-Ahead Scheduling)
 // ============================================================================
 
@@ -18,8 +125,17 @@ class MetronomeAudioEngine {
     this.scheduleInterval = 25; // How often scheduler runs (ms)
     this.timerId = null;
 
+    // Voices already handed to Web Audio and not finished yet. The transport
+    // uses this to cancel the look-ahead window on pause / stop / reset —
+    // clearing the scheduler interval alone leaves scheduled nodes alive.
+    this.activeVoices = new Set();
+
     // Callbacks
     this.onBeatScheduled = null; // Called when a beat is scheduled
+
+    // Voice currently being built by playClick(); synths register their
+    // sources here so the transport can cancel them on pause/stop/reset.
+    this._currentVoice = null;
 
     // Sound Synthesizers
     this.soundEngines = {
@@ -51,9 +167,18 @@ class MetronomeAudioEngine {
 
   // --- Sound Synthesizers (Web Audio Synthesis, 0 external assets) ---
 
+  // Register a source node with the voice currently being built by playClick().
+  // Returns the node unchanged so synths can stay one-liners.
+  trackVoiceNode(node) {
+    if (this._currentVoice) {
+      this._currentVoice.nodes.push(node);
+    }
+    return node;
+  }
+
   synthClassic(time, isAccent, destination) {
     const ctx = this.audioCtx;
-    const osc = ctx.createOscillator();
+    const osc = this.trackVoiceNode(ctx.createOscillator());
     const env = ctx.createGain();
 
     const startFreq = isAccent ? 2200 : 1300;
@@ -78,7 +203,7 @@ class MetronomeAudioEngine {
     const ctx = this.audioCtx;
 
     // Tuned body
-    const osc = ctx.createOscillator();
+    const osc = this.trackVoiceNode(ctx.createOscillator());
     const oscEnv = ctx.createGain();
     const freq = isAccent ? 980 : 720;
     osc.type = 'sine';
@@ -100,7 +225,7 @@ class MetronomeAudioEngine {
       output[i] = Math.random() * 2 - 1;
     }
 
-    const noise = ctx.createBufferSource();
+    const noise = this.trackVoiceNode(ctx.createBufferSource());
     noise.buffer = noiseBuffer;
 
     const filter = ctx.createBiquadFilter();
@@ -122,7 +247,7 @@ class MetronomeAudioEngine {
 
   synthElectronic(time, isAccent, destination) {
     const ctx = this.audioCtx;
-    const osc = ctx.createOscillator();
+    const osc = this.trackVoiceNode(ctx.createOscillator());
     const env = ctx.createGain();
 
     osc.type = 'square';
@@ -145,7 +270,7 @@ class MetronomeAudioEngine {
 
   synthSoft(time, isAccent, destination) {
     const ctx = this.audioCtx;
-    const osc = ctx.createOscillator();
+    const osc = this.trackVoiceNode(ctx.createOscillator());
     const env = ctx.createGain();
 
     osc.type = 'sine';
@@ -171,7 +296,7 @@ class MetronomeAudioEngine {
     const f2 = isAccent ? 890 : 800;
 
     [f1, f2].forEach((freq) => {
-      const osc = ctx.createOscillator();
+      const osc = this.trackVoiceNode(ctx.createOscillator());
       const env = ctx.createGain();
 
       osc.type = 'square';
@@ -195,19 +320,83 @@ class MetronomeAudioEngine {
   }
 
   // Play click using selected sound
-  playClick(time, beatType, soundType, volume, accentVolume) {
+  playClick(time, beatType, soundType, volume, accentVolume, layerId) {
     if (beatType === 'mute') return;
 
     const ctx = this.ensureContext();
     const isAccent = beatType === 'accent';
     const finalVolume = isAccent ? volume * accentVolume : volume;
 
+    // Defensive: a non-finite volume or time would poison the whole voice.
+    if (!Number.isFinite(time) || !Number.isFinite(finalVolume)) return;
+
     const gainNode = ctx.createGain();
     gainNode.gain.setValueAtTime(Math.min(1.0, Math.max(0, finalVolume)), time);
     gainNode.connect(this.masterGain);
 
-    const synthFn = this.soundEngines[soundType] || this.soundEngines.classic;
-    synthFn(time, isAccent, gainNode);
+    // Longest synth tail (cowbell, 0.28s) plus margin: a voice is finished
+    // once AudioContext time passes this, so it can be pruned.
+    const voice = { nodes: [], gainNode, endTime: time + 0.35, layerId };
+    this._currentVoice = voice;
+    try {
+      const synthFn = this.soundEngines[soundType] || this.soundEngines.classic;
+      synthFn(time, isAccent, gainNode);
+    } finally {
+      this._currentVoice = null;
+    }
+
+    if (voice.nodes.length > 0) {
+      this.pruneFinishedVoices();
+      this.activeVoices.add(voice);
+    }
+  }
+
+  // Drop voices whose last node has already finished playing.
+  pruneFinishedVoices() {
+    if (this.activeVoices.size === 0) return;
+    const now = this.currentTime;
+    this.activeVoices.forEach((voice) => {
+      if (voice.endTime <= now) this.activeVoices.delete(voice);
+    });
+  }
+
+  // Silence everything already handed to Web Audio (the look-ahead window).
+  // Clearing the scheduler interval alone leaves those nodes scheduled, so a
+  // pause would still produce a short click tail. This does not touch the
+  // AudioContext clock, so timing model and browser/Electron behaviour are
+  // unchanged — only the pending voices are cancelled.
+  // Pass a layerId to cancel just that layer's pending voices.
+  cancelScheduledVoices(layerId) {
+    if (!this.audioCtx || this.activeVoices.size === 0) {
+      this.activeVoices.clear();
+      return;
+    }
+
+    const now = this.currentTime;
+    const cancelled = new Set();
+    this.activeVoices.forEach((voice) => {
+      if (layerId !== undefined && voice.layerId !== layerId) return;
+      cancelled.add(voice);
+
+      try {
+        // Zero the per-click gain first: a cancelled exponential ramp would
+        // otherwise be re-evaluated from the old curve.
+        voice.gainNode.gain.cancelScheduledValues(now);
+        voice.gainNode.gain.setValueAtTime(0, now);
+      } catch (e) {
+        console.warn('Failed to silence scheduled voice gain:', e);
+      }
+
+      voice.nodes.forEach((node) => {
+        try {
+          node.stop(now);
+        } catch (e) {
+          // Already stopped / never started: nothing left to cancel.
+        }
+      });
+    });
+
+    cancelled.forEach((voice) => this.activeVoices.delete(voice));
   }
 }
 
@@ -224,7 +413,53 @@ class MetronomeState {
     this.activePresetId = null;
 
     // Visual queue for synchronization
-    this.visualQueue = []; // array of { layerId, subdivIndex, audioTime }
+    this.visualQueue = []; // array of { layerId, subdivIndex, audioTime }, sorted by audioTime
+
+    // Monotonic tie-breaker so events with identical audioTime keep their
+    // insertion order and sorting stays stable across engines.
+    this.visualSeq = 0;
+  }
+
+  // Insert a visual event so the queue is always ordered globally by
+  // audioTime — not grouped by layer. Binary search over the tail because new
+  // events are normally the latest ones; equal timestamps keep FIFO order.
+  enqueueVisualEvent(layerId, subdivIndex, audioTime) {
+    if (!Number.isFinite(audioTime)) return;
+
+    const queue = this.visualQueue;
+    const event = { layerId, subdivIndex, audioTime, seq: this.visualSeq++ };
+
+    let low = 0;
+    let high = queue.length;
+    while (low < high) {
+      const mid = (low + high) >> 1;
+      const midEvent = queue[mid];
+      if (
+        midEvent.audioTime < audioTime ||
+        (midEvent.audioTime === audioTime && midEvent.seq <= event.seq)
+      ) {
+        low = mid + 1;
+      } else {
+        high = mid;
+      }
+    }
+    queue.splice(low, 0, event);
+  }
+
+  // Remove and return every event whose audio time has arrived, earliest first.
+  takeDueVisualEvents(now) {
+    const queue = this.visualQueue;
+    let count = 0;
+    while (count < queue.length && queue[count].audioTime <= now) {
+      count++;
+    }
+    if (count === 0) return [];
+    return queue.splice(0, count);
+  }
+
+  clearVisualQueue() {
+    this.visualQueue.length = 0;
+    this.visualSeq = 0;
   }
 
   // Calculate subdivision interval in seconds:
@@ -232,9 +467,11 @@ class MetronomeState {
   // Sixteenth (den=16): 60 / BPM / (16/4) = 60 / BPM / 4
   // Generic: (4 / denominator) * (60 / (BPM * multiplier))
   getSubdivDuration(layer) {
-    const num = Math.max(1, layer.numerator);
-    const den = Math.max(1, layer.denominator);
-    const effectiveBpm = Math.max(10, this.bpm * layer.bpmMultiplier);
+    const num = Math.max(1, toFiniteNumber(layer.numerator) ?? 1);
+    const den = Math.max(1, toFiniteNumber(layer.denominator) ?? 1);
+    const bpm = toFiniteNumber(this.bpm) ?? 140;
+    const multiplier = toFiniteNumber(layer.bpmMultiplier) ?? 1;
+    const effectiveBpm = Math.max(10, bpm * multiplier);
     return (4 / den) * (60 / effectiveBpm);
   }
 
@@ -255,30 +492,103 @@ class MetronomeState {
     return groups;
   }
 
-  // Create a new layer with default settings
+  // Validate and normalize a whole configuration document — the shared path
+  // for URL hashes and saved presets, so neither can bypass the constraints.
+  // Returns { ok: true, bpm, layers } or { ok: false, reason }.
+  // Structural problems reject the document; numeric problems are clamped or
+  // replaced by defaults, matching what the UI itself allows.
+  normalizeConfiguration(raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, reason: 'configuration is not an object' };
+    }
+    if (!Array.isArray(raw.layers)) {
+      return { ok: false, reason: 'configuration has no layer array' };
+    }
+    if (raw.layers.length === 0) {
+      return { ok: false, reason: 'configuration has no layers' };
+    }
+    if (raw.layers.length > METRONOME_LIMITS.maxLayers) {
+      return { ok: false, reason: `configuration exceeds ${METRONOME_LIMITS.maxLayers} layers` };
+    }
+
+    const layers = [];
+    for (let idx = 0; idx < raw.layers.length; idx++) {
+      const rawLayer = raw.layers[idx];
+      if (rawLayer === null || typeof rawLayer !== 'object' || Array.isArray(rawLayer)) {
+        return { ok: false, reason: `layer ${idx + 1} is not an object` };
+      }
+
+      const numerator = clampInt(rawLayer.numerator, METRONOME_LIMITS.numerator, null);
+      if (numerator === null) {
+        return { ok: false, reason: `layer ${idx + 1} has an invalid numerator` };
+      }
+
+      // Grouping structure is checked, but its sum is not: incomplete groupings
+      // are a supported editing state.
+      const groups = normalizeGroups(rawLayer.groups, this.autoGroup(numerator));
+      if (groups === null) {
+        return { ok: false, reason: `layer ${idx + 1} has an invalid grouping` };
+      }
+
+      const overrides = normalizeOverrides(rawLayer.overrides, numerator);
+      if (overrides === null) {
+        return { ok: false, reason: `layer ${idx + 1} has invalid overrides` };
+      }
+
+      layers.push(this.createLayer({
+        name: rawLayer.name,
+        numerator,
+        denominator: rawLayer.denominator,
+        bpmMultiplier: rawLayer.bpmMultiplier,
+        groups,
+        overrides,
+        sound: rawLayer.sound,
+        volume: rawLayer.volume,
+        accentVolume: rawLayer.accentVolume,
+        muted: rawLayer.muted,
+        color: this.getLayerColor(idx),
+      }));
+    }
+
+    return {
+      ok: true,
+      bpm: clampInt(raw.bpm, METRONOME_LIMITS.bpm, 120),
+      layers,
+    };
+  }
+
+  // Create a new layer with default settings.
+  // Every incoming value is normalized here, so callers (UI, URL hash,
+  // presets) cannot inject NaN/Infinity or out-of-range numbers into the
+  // scheduler. Structurally invalid input is rejected by
+  // normalizeConfiguration() before this is reached.
   createLayer(config = {}) {
     const id = 'layer_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
-    const numerator = config.numerator !== undefined ? Math.max(1, parseInt(config.numerator, 10)) : 59;
-    const denominator = config.denominator !== undefined ? Math.max(1, parseInt(config.denominator, 10)) : 16;
-    const groups = config.groups ? [...config.groups] : this.autoGroup(numerator);
+
+    const numerator = clampInt(config.numerator, METRONOME_LIMITS.numerator, 59);
+    const denominator = clampInt(config.denominator, METRONOME_LIMITS.denominator, 16);
+    const groups = normalizeGroups(config.groups, this.autoGroup(numerator)) || this.autoGroup(numerator);
+    const overrides = normalizeOverrides(config.overrides, numerator) || {};
+    const name = normalizeName(config.name, `Layer ${this.layers.length + 1}`);
+    const sound = METRONOME_SOUNDS.includes(config.sound) ? config.sound : 'classic';
 
     return {
       id,
-      name: config.name || `Layer ${this.layers.length + 1}`,
+      name,
       numerator,
       denominator,
-      bpmMultiplier: config.bpmMultiplier || 1.0,
+      bpmMultiplier: clampNumber(config.bpmMultiplier, METRONOME_LIMITS.bpmMultiplier, 1.0),
       groups,
-      overrides: config.overrides ? { ...config.overrides } : {}, // { [subdivIndex]: 'accent'|'normal'|'mute' }
-      sound: config.sound || 'classic',
-      volume: config.volume !== undefined ? config.volume : 0.8,
-      accentVolume: config.accentVolume !== undefined ? config.accentVolume : 1.3,
+      overrides, // { [subdivIndex]: 'accent'|'normal'|'mute' }
+      sound,
+      volume: clampNumber(config.volume, METRONOME_LIMITS.volume, 0.8),
+      accentVolume: clampNumber(config.accentVolume, METRONOME_LIMITS.accentVolume, 1.3),
       muted: !!config.muted,
 
       // Runtime scheduler state
       nextNoteTime: 0,
       currentSubdiv: 0,
-      color: config.color || this.getLayerColor(this.layers.length),
+      color: typeof config.color === 'string' && config.color ? config.color : this.getLayerColor(this.layers.length),
     };
   }
 
@@ -519,19 +829,45 @@ class MetronomeApp {
     this.state.isPaused = false;
     this.acquireWakeLock();
 
+    // Defensive: never inherit a queue from a previous transport state, and
+    // never leave a second interval running.
+    this.state.clearVisualQueue();
+    if (this.audioEngine.timerId) {
+      clearInterval(this.audioEngine.timerId);
+      this.audioEngine.timerId = null;
+    }
+
     const startTime = ctx.currentTime + 0.05;
 
-    // Reset nextNoteTime for all layers
+    // Re-anchor the audio timeline. currentSubdiv is preserved, so playback
+    // resumes at the same musical position (pause never rewinds the position).
     this.state.layers.forEach((layer) => {
       layer.nextNoteTime = startTime;
     });
 
-    if (this.audioEngine.timerId) {
-      clearInterval(this.audioEngine.timerId);
-    }
-
     this.audioEngine.timerId = setInterval(() => this.scheduler(), this.audioEngine.scheduleInterval);
     this.updateTransportUI();
+  }
+
+  // Before dropping the queue, rewind each layer to the earliest subdivision
+  // that was scheduled into the look-ahead window but had not become audible
+  // yet. Resume restarts exactly there: nothing from the cancelled window is
+  // lost, and nothing already heard is replayed. Events whose audioTime has
+  // already passed were audible and must not be rewound.
+  capturePendingPositions() {
+    const now = this.audioEngine.audioCtx ? this.audioEngine.currentTime : 0;
+    const pending = new Map();
+    this.state.visualQueue.forEach((event) => {
+      if (event.audioTime <= now) return;
+      if (!pending.has(event.layerId)) {
+        pending.set(event.layerId, event.subdivIndex);
+      }
+    });
+    this.state.layers.forEach((layer) => {
+      if (pending.has(layer.id)) {
+        layer.currentSubdiv = pending.get(layer.id);
+      }
+    });
   }
 
   pausePlayback() {
@@ -542,6 +878,14 @@ class MetronomeApp {
       clearInterval(this.audioEngine.timerId);
       this.audioEngine.timerId = null;
     }
+
+    // Keep the musical position, but discard the events tied to the old
+    // timeline. AudioContext.currentTime keeps advancing while paused, so
+    // those timestamps are meaningless after resume.
+    this.capturePendingPositions();
+    this.state.clearVisualQueue();
+    this.audioEngine.cancelScheduledVoices();
+
     this.updateTransportUI();
   }
 
@@ -558,7 +902,8 @@ class MetronomeApp {
     this.state.layers.forEach((layer) => {
       layer.currentSubdiv = 0;
     });
-    this.state.visualQueue = [];
+    this.state.clearVisualQueue();
+    this.audioEngine.cancelScheduledVoices();
 
     // Clear active playhead styles
     document.querySelectorAll('.subdiv-cell.active-playhead').forEach((el) => {
@@ -569,16 +914,33 @@ class MetronomeApp {
   }
 
   resetPosition() {
+    // Cancel first: otherwise the look-ahead window scheduled for the old
+    // position would still sound after the playhead jumped back to beat 1.
+    this.audioEngine.cancelScheduledVoices();
+    this.state.clearVisualQueue();
+
     this.state.layers.forEach((layer) => {
       layer.currentSubdiv = 0;
       if (this.state.isPlaying && this.audioEngine.audioCtx) {
         layer.nextNoteTime = this.audioEngine.currentTime + 0.05;
       }
     });
-    this.state.visualQueue = [];
     document.querySelectorAll('.subdiv-cell.active-playhead').forEach((el) => {
       el.classList.remove('active-playhead');
     });
+  }
+
+  // Removing a layer while playing must also drop its pending visual events
+  // and cancel the voices it already scheduled: the layer element disappears,
+  // so those events could only act on a stale id, and its clicks would
+  // otherwise still sound from the look-ahead window.
+  removeLayer(layerId) {
+    if (this.state.layers.length <= 1) return;
+
+    this.state.layers = this.state.layers.filter((l) => l.id !== layerId);
+    this.state.visualQueue = this.state.visualQueue.filter((event) => event.layerId !== layerId);
+    this.audioEngine.cancelScheduledVoices(layerId);
+    this.renderLayers();
   }
 
   // Scheduler: runs every 25ms, schedules audio ahead of time in AudioContext
@@ -590,9 +952,14 @@ class MetronomeApp {
 
     this.state.layers.forEach((layer) => {
       if (layer.muted) return;
-      if (layer.numerator <= 0 || layer.denominator <= 0) return;
+      if (!(layer.numerator > 0) || !(layer.denominator > 0)) return;
 
       const subdivDuration = this.state.getSubdivDuration(layer);
+      // A non-finite or non-positive duration would spin this loop forever.
+      if (!Number.isFinite(subdivDuration) || subdivDuration <= 0) {
+        console.warn('Skipping layer with invalid subdivision duration:', layer.id, subdivDuration);
+        return;
+      }
 
       // Catch-up if nextNoteTime fell behind
       if (layer.nextNoteTime < currentTime) {
@@ -609,15 +976,14 @@ class MetronomeApp {
           beatType,
           layer.sound,
           layer.volume,
-          layer.accentVolume
+          layer.accentVolume,
+          layer.id
         );
 
-        // Enqueue for visual display synchronization
-        this.state.visualQueue.push({
-          layerId: layer.id,
-          subdivIndex: beatIndex,
-          audioTime: layer.nextNoteTime,
-        });
+        // Enqueue for visual display synchronization. The queue orders events
+        // globally by audioTime, so layers with different subdivision
+        // intervals cannot block each other.
+        this.state.enqueueVisualEvent(layer.id, beatIndex, layer.nextNoteTime);
 
         // Advance layer time
         layer.nextNoteTime += subdivDuration;
@@ -632,9 +998,10 @@ class MetronomeApp {
       if (this.state.isPlaying && this.audioEngine.audioCtx) {
         const now = this.audioEngine.currentTime;
 
-        // Process scheduled visual beats whose audio time has arrived
-        while (this.state.visualQueue.length > 0 && this.state.visualQueue[0].audioTime <= now) {
-          const beat = this.state.visualQueue.shift();
+        // Process every scheduled visual beat whose audio time has arrived,
+        // in chronological order across all layers.
+        const due = this.state.takeDueVisualEvents(now);
+        for (const beat of due) {
           this.highlightBeat(beat.layerId, beat.subdivIndex);
         }
       }
@@ -1060,8 +1427,7 @@ class MetronomeApp {
     if (delBtn) {
       delBtn.addEventListener('click', () => {
         if (this.state.layers.length > 1) {
-          this.state.layers = this.state.layers.filter((l) => l.id !== layer.id);
-          this.renderLayers();
+          this.removeLayer(layer.id);
         }
       });
     }
@@ -1209,8 +1575,9 @@ class MetronomeApp {
       chip.className = 'preset-chip';
       chip.innerHTML = `<button class="preset-chip-load">${this.escapeHtml(preset.name)}</button>`;
       chip.querySelector('.preset-chip-load').addEventListener('click', () => {
-        this.loadPresetData(preset);
-        this.showToast(`已加载预设：${preset.name}`);
+        if (this.loadPresetData(preset)) {
+          this.showToast(`已加载预设：${preset.name}`);
+        }
       });
       this.dom.factoryPresets.appendChild(chip);
     });
@@ -1219,13 +1586,27 @@ class MetronomeApp {
     this.renderUserPresets();
   }
 
+  // Corrupted storage must degrade to "no presets", never throw during init.
+  // Entries are returned as-is (minus structural junk) so the raw index stays
+  // usable for deletion; each preset is validated when it is loaded.
   getUserPresets() {
     try {
       const data = localStorage.getItem('polyrhythm_metronome_presets');
-      return data ? JSON.parse(data) : [];
-    } catch {
+      if (!data) return [];
+      const parsed = JSON.parse(data);
+      if (!Array.isArray(parsed)) {
+        console.warn('Ignoring preset storage: value is not an array.');
+        return [];
+      }
+      return parsed;
+    } catch (e) {
+      console.warn('Failed to read preset storage:', e);
       return [];
     }
+  }
+
+  isPresetLike(preset) {
+    return !!preset && typeof preset === 'object' && !Array.isArray(preset);
   }
 
   saveUserPresetsToStorage(presets) {
@@ -1246,23 +1627,27 @@ class MetronomeApp {
     }
 
     presets.forEach((preset, index) => {
+      const presetName = this.isPresetLike(preset) && typeof preset.name === 'string'
+        ? preset.name
+        : `Preset ${index + 1}`;
       const chip = document.createElement('div');
       chip.className = 'preset-chip';
       chip.innerHTML = `
-        <button class="preset-chip-load">${this.escapeHtml(preset.name)}</button>
+        <button class="preset-chip-load">${this.escapeHtml(presetName)}</button>
         <button class="preset-chip-del" title="删除预设">✕</button>
       `;
 
       chip.querySelector('.preset-chip-load').addEventListener('click', () => {
-        this.loadPresetData(preset);
-        this.showToast(`已加载预设：${preset.name}`);
+        if (this.loadPresetData(preset)) {
+          this.showToast(`已加载预设：${presetName}`);
+        }
       });
 
       chip.querySelector('.preset-chip-del').addEventListener('click', () => {
         const updated = this.getUserPresets().filter((_, i) => i !== index);
         this.saveUserPresetsToStorage(updated);
         this.renderUserPresets();
-        this.showToast(`已删除预设：${preset.name}`);
+        this.showToast(`已删除预设：${presetName}`);
       });
 
       this.dom.userPresets.appendChild(chip);
@@ -1296,24 +1681,35 @@ class MetronomeApp {
   }
 
   loadPresetData(preset) {
+    // Presets use the long-form field names. Route them through the same
+    // validator as shared URLs so a hand-edited localStorage entry cannot
+    // inject NaN/Infinity or out-of-range meters into the scheduler.
+    const normalized = this.state.normalizeConfiguration(preset);
+    if (!normalized.ok) {
+      console.warn('Rejected preset:', normalized.reason, preset);
+      this.showToast('该预设数据无效，已保持当前配置。');
+      return false;
+    }
+
     const wasPlaying = this.state.isPlaying;
     if (wasPlaying) {
       this.stopPlayback();
     }
 
-    this.state.bpm = preset.bpm || 120;
-    this.state.layers = (preset.layers || []).map((l, idx) => {
-      return this.state.createLayer({
-        ...l,
-        color: this.state.getLayerColor(idx),
-      });
-    });
-
-    this.renderAll();
+    this.applyConfiguration(normalized);
 
     if (wasPlaying) {
       this.startPlayback();
     }
+    return true;
+  }
+
+  // Single place that swaps the live configuration and resets transport state.
+  applyConfiguration({ bpm, layers }) {
+    this.state.bpm = bpm;
+    this.state.layers = layers;
+    this.state.clearVisualQueue();
+    this.renderAll();
   }
 
   // ==========================================================================
@@ -1354,43 +1750,70 @@ class MetronomeApp {
     }
   }
 
+  // Expand the compact share-link field names into the long form used by
+  // presets, so both formats meet in normalizeConfiguration(). Non-object
+  // entries are passed through untouched for the validator to reject.
+  expandUrlConfiguration(config) {
+    return {
+      bpm: config.bpm,
+      layers: config.layers.map((l) => {
+        if (l === null || typeof l !== 'object' || Array.isArray(l)) return l;
+
+        // `ov` is the compact [[index, type], ...] form; `overrides` is
+        // accepted too so older/hand-written links keep working.
+        const overrides = l.ov !== undefined ? l.ov : l.overrides;
+        return {
+          name: l.n !== undefined ? l.n : l.name,
+          numerator: l.num !== undefined ? l.num : l.numerator,
+          denominator: l.den !== undefined ? l.den : l.denominator,
+          bpmMultiplier: l.mul !== undefined ? l.mul : l.bpmMultiplier,
+          groups: l.g !== undefined ? l.g : l.groups,
+          overrides,
+          sound: l.snd !== undefined ? l.snd : l.sound,
+          volume: l.vol !== undefined ? l.vol : l.volume,
+          accentVolume: l.av !== undefined ? l.av : l.accentVolume,
+          muted: l.m !== undefined ? !!l.m : !!l.muted,
+        };
+      }),
+    };
+  }
+
   loadStateFromUrl() {
     const hash = window.location.hash.slice(1);
     if (!hash) return false;
 
+    // Bound the work before decoding: a huge or malformed hash must not be
+    // able to stall or crash initialization.
+    if (hash.length > METRONOME_LIMITS.maxPayloadLength) {
+      console.warn('Ignoring URL config: payload too large.');
+      return false;
+    }
+
+    let config;
     try {
-      const jsonStr = decodeURIComponent(atob(hash));
-      const config = JSON.parse(jsonStr);
-
-      if (config.bpm) this.state.bpm = config.bpm;
-
-      if (Array.isArray(config.layers) && config.layers.length > 0) {
-        this.state.layers = config.layers.map((l, idx) => {
-          const overrides = {};
-          if (Array.isArray(l.ov)) {
-            l.ov.forEach(([k, v]) => { overrides[k] = v; });
-          }
-
-          return this.state.createLayer({
-            name: l.n,
-            numerator: l.num,
-            denominator: l.den,
-            bpmMultiplier: l.mul,
-            groups: l.g,
-            overrides,
-            sound: l.snd,
-            volume: l.vol,
-            accentVolume: l.av,
-            muted: !!l.m,
-            color: this.state.getLayerColor(idx),
-          });
-        });
-        return true;
-      }
+      config = JSON.parse(decodeURIComponent(atob(hash)));
     } catch (e) {
       console.warn('Failed to parse URL config:', e);
+      return false;
     }
-    return false;
+
+    if (config === null || typeof config !== 'object' || Array.isArray(config)) {
+      console.warn('Ignoring URL config: not a configuration object.');
+      return false;
+    }
+    if (!Array.isArray(config.layers)) {
+      console.warn('Ignoring URL config: missing layer array.');
+      return false;
+    }
+
+    const normalized = this.state.normalizeConfiguration(this.expandUrlConfiguration(config));
+    if (!normalized.ok) {
+      console.warn('Ignoring URL config:', normalized.reason);
+      return false;
+    }
+
+    this.applyConfiguration(normalized);
+    return true;
   }
 
   // Toast feedback
