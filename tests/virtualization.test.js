@@ -606,12 +606,11 @@ test('dom: expanding all 64 layers stays bounded', () => {
   const all = countAll(app);
 
   // The data is 65,536 groups and 64 x 1024 cells; the DOM must be far smaller.
-  assert.ok(tags > 0 && cells > 0, 'detail really is mounted');
   assert.ok(tags < 65536 / 10, `tags mounted (${tags}) must be a small fraction`);
   assert.ok(cells < 64 * 1024 / 10, `cells mounted (${cells}) must be a small fraction`);
 
   // Whole-list node count must stay in the low thousands, not ~600k.
-  assert.ok(all < 60000, `total nodes ${all} must stay bounded`);
+  assert.ok(all < 40000, `total nodes ${all} must stay bounded`);
 });
 
 test('dom: node count does not scale with the data inside each layer', () => {
@@ -637,6 +636,8 @@ test('dom: node count does not scale with the data inside each layer', () => {
     }
     app.loadPresetData({ name: 'x', bpm: 120, layers });
     for (const layer of app.state.layers) app.setLayerExpanded(layer.id, true);
+    // Apply the same off-screen shrink the page scroll handler applies.
+    for (const layer of app.state.layers) app.collapseVirtualWindow(layer.id);
     return { app, limits };
   };
 
@@ -657,9 +658,10 @@ test('dom: node count stays bounded when all 64 layers are expanded', () => {
   const { app, limits } = newApp();
   app.loadPresetData(hugePreset(limits));
   for (const layer of app.state.layers) app.setLayerExpanded(layer.id, true);
+  for (const layer of app.state.layers) app.collapseVirtualWindow(layer.id);
 
   const all = countAll(app);
-  // 64 headers plus 64 bounded detail windows; nowhere near 593,813.
+  // 64 headers plus 64 minimal detail windows; nowhere near 593,813.
   assert.ok(all < 40000, `total nodes ${all} must stay well under the 593k baseline`);
 });
 

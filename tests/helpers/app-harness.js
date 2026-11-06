@@ -130,6 +130,36 @@ function createElement(tag = 'div') {
       }
       return null;
     },
+    getAttribute(name) {
+      if (name === 'class') return el.className || '';
+      if (name === 'id') return el.id || '';
+      if (name === 'tabindex') return el.tabIndex === undefined ? null : String(el.tabIndex);
+      if (name.startsWith('data-')) {
+        const key = name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+        const v = el.dataset ? el.dataset[key] : undefined;
+        return v === undefined ? null : String(v);
+      }
+      if (el.__attrs && Object.prototype.hasOwnProperty.call(el.__attrs, name)) {
+        return String(el.__attrs[name]);
+      }
+      // Typed properties the parser may have set directly (role, aria-*).
+      if (name === 'role' && el.role) return String(el.role);
+      if (el.aria && Object.prototype.hasOwnProperty.call(el.aria, name)) {
+        return String(el.aria[name]);
+      }
+      const direct = el[name];
+      return direct === undefined ? null : String(direct);
+    },
+    setAttribute(name, value) {
+      if (name === 'tabindex') { el.tabIndex = Number(value); return; }
+      if (name === 'class') { el.className = String(value); return; }
+      el.__attrs = el.__attrs || {};
+      el.__attrs[name] = String(value);
+    },
+    removeAttribute(name) {
+      if (name === 'tabindex') { el.tabIndex = -1; return; }
+      if (el.__attrs) delete el.__attrs[name];
+    },
     getBoundingClientRect: () => ({ left: 0, right: 0, top: 0, bottom: 0, width: 0, height: 0 }),
     focus() {},
   };
@@ -174,6 +204,7 @@ function applyAttrs(el, attrs) {
     else if (name === 'value') el.value = value;
     else if (name === 'title') el.title = value;
     else if (name === 'style') el.style = value;
+    else if (name === 'tabindex') el.tabIndex = Number(value);
     else if (name.startsWith('data-')) {
       const key = name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
       el.dataset[key] = value;
@@ -657,6 +688,8 @@ function createApp(harness, options = {}) {
   app.virtualObservers = new Map();
   app.virtualRefreshQueued = new Map();
   app.currentPlayhead = new Map();
+  app.pendingCellIndex = new Map();
+  app.gridCursor = new Map();
 
   // Behaviour that belongs to the view layer.
   app.toasts = [];

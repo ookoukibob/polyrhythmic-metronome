@@ -869,22 +869,32 @@ button, .subdiv-cell, .tap-btn, .step-btn {
   flex-direction: column;
   align-items: center;
   gap: 4px;
+  /* Fixed pitch: the virtual spacer maths assumes every cell occupies exactly
+     this width, so group boundaries must not alter it. */
+  width: 32px;
+  flex: 0 0 32px;
+  box-sizing: border-box;
 }
 
+/* Group boundary marker.
+   The divider is a pure decoration: it must NOT change layout width, otherwise
+   the virtualised grid's spacer arithmetic (index * fixed pitch) would drift
+   from the real layout. The marker therefore lives inside the wrap's own box
+   via ::before and the wrap keeps a fixed pitch like every other cell. */
 .subdiv-cell-wrap.group-start {
-  margin-left: 8px;
   position: relative;
 }
 
 .subdiv-cell-wrap.group-start::before {
   content: "";
   position: absolute;
-  left: -5px;
+  left: 1px;
   top: 0;
   bottom: 0;
   width: 2px;
   background: var(--border-active);
   border-radius: 1px;
+  pointer-events: none;
 }
 
 .subdiv-cell {
@@ -1561,7 +1571,12 @@ img, svg, video, canvas {
   }
 
   .subdiv-cell-wrap.group-start {
-    margin-left: 12px;
+    /* No margin: the boundary marker must not change the cell pitch. */
+  }
+
+  .subdiv-cell-wrap {
+    width: 46px;
+    flex: 0 0 46px;
   }
 
   .subdiv-cell {
@@ -1686,6 +1701,11 @@ img, svg, video, canvas {
     width: 68px;
     height: 44px;
     font-size: 22px;
+  }
+
+  .subdiv-cell-wrap {
+    width: 44px;
+    flex: 0 0 44px;
   }
 
   .subdiv-cell {

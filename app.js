@@ -53,12 +53,23 @@ const LAYER_RENDER_POLICY = Object.freeze({
 // scroll. They are intentionally the design constants from style.css; a real
 // measurement overrides them per layer on first render.
 const VIRTUAL_POLICY = Object.freeze({
-  // Extra items mounted above/below the visible slice, to hide scroll gaps.
+  // --- pattern cells: units are CELLS -------------------------------------
+  // Extra cells mounted before/after the visible slice.
   overscanItems: 6,
-  // Force at least this many items mounted even when the viewport is unknown
-  // (e.g. first paint before layout has happened).
+  // Minimum cells to mount when the viewport size is not yet known.
   minWindowItems: 24,
-  // Below this many items, mounting everything is cheaper than virtualising.
+
+  // --- group tags: units are ROWS -----------------------------------------
+  // Tags wrap, so the layout unit is a row. Keeping these separate from the
+  // cell settings avoids mixing "items" with "rows", which would mount hundreds
+  // of tags to satisfy a per-item minimum.
+  overscanRows: 2,
+  minGroupRows: 3,
+
+  // --- shared -------------------------------------------------------------
+  // Below this many ITEMS (groups or cells) a collection mounts in full and
+  // skips virtualisation entirely. For groups this is a group count, never a
+  // row count.
   fullRenderThreshold: 120,
   // Fallback geometry, used until a layer's real size is measured.
   fallbackTagWidth: 92,   // .group-tag incl. gap
@@ -1011,6 +1022,8 @@ class MetronomeApp {
     // coalescing set so a burst of resize/scroll signals costs one remount.
     this.virtualObservers = new Map();
     this.virtualRefreshQueued = new Map();
+    this.pendingCellIndex = new Map();
+    this.gridCursor = new Map();
 
     // Check URL state first, otherwise load default
     if (!this.loadStateFromUrl()) {
@@ -1297,6 +1310,16 @@ class MetronomeApp {
     const layerEl = document.getElementById(layerId);
     if (!layerEl) return;
 
+    const wrap = layerEl.querySelector('.subdivision-scroll-wrap');
+
+    // Auto-follow must work even when the target cell is not mounted, so the
+    // target position is computed from geometry rather than measured from a
+    // DOM node. Without this the playhead stopped following once it left the
+    // mounted window.
+    if (wrap) {
+      this.followPlayhead(layerEl, wrap, subdivIndex);
+    }
+
     // Remove previous playhead in this layer
     const prev = layerEl.querySelector('.subdiv-cell.active-playhead');
     if (prev) {
@@ -1308,31 +1331,67 @@ class MetronomeApp {
     if (!cell) return;
     cell.classList.add('active-playhead');
 
-    // Horizontal auto-follow: adjust ONLY this layer's own scroll wrapper by
-    // setting its scrollLeft directly. Never uses scrollIntoView or any API
-    // that could scroll the page. Follows only when the cell leaves the
-    // wrapper's visible content box, and by the minimum distance needed —
-    // so a user's manual horizontal position is not reset every beat.
-    const wrap = layerEl.querySelector('.subdivision-scroll-wrap');
-    if (!wrap) return;
-    const wrapRect = this.rectOf(wrap);
-    const cellRect = this.rectOf(cell);
-    let leftEdge = wrapRect.left;
-    let rightEdge = wrapRect.right;
-    if (typeof getComputedStyle === 'function') {
-      const cs = getComputedStyle(wrap);
-      leftEdge += parseFloat(cs.paddingLeft) || 0;
-      rightEdge -= parseFloat(cs.paddingRight) || 0;
+    // Mounted and highlighted: the pending request has been satisfied.
+    if (this.pendingCellIndex) this.pendingCellIndex.delete(layerId);
+  }
+
+  // Scroll this layer's pattern scroller so the given beat is visible, using
+  // only geometry (the cell may not exist yet). Called at most once per beat,
+  // and only scrolls when the beat is actually outside the visible band, so a
+  // user's manual horizontal position is preserved and no layout is forced per
+  // audio event.
+  followPlayhead(layerEl, wrap, subdivIndex) {
+    const grid = wrap.querySelector('.subdivision-grid');
+    if (!grid) return;
+
+    const layer = this.state.layers.find((l) => l.id === layerEl.id);
+    if (!layer) return;
+
+    const geom = this.getCellGeometry(grid);
+    const pitch = geom.itemWidth;
+    if (!(pitch > 0)) return;
+
+    // Full grid width from geometry, never from scrollWidth: the scroller's
+    // content width collapses whenever the mounted window is rebuilt.
+    const contentWidth = layer.numerator * pitch;
+    if (!(contentWidth > 0)) return;
+
+    const viewWidth = wrap.clientWidth || 0;
+    if (!(viewWidth > 0)) return;
+
+    const cellLeft = subdivIndex * pitch;
+    const cellRight = cellLeft + pitch;
+
+    const viewLeft = wrap.scrollLeft;
+    const viewRight = viewLeft + viewWidth;
+
+    const margin = Math.min(pitch * 2, Math.max(0, viewWidth / 4));
+
+    let target = null;
+    if (cellLeft < viewLeft + margin) {
+      target = Math.max(0, cellLeft - margin);
+    } else if (cellRight > viewRight - margin) {
+      target = Math.min(Math.max(0, contentWidth - viewWidth),
+        cellRight - viewWidth + margin);
     }
-    let delta = 0;
-    if (cellRect.left < leftEdge) {
-      delta = cellRect.left - leftEdge;
-    } else if (cellRect.right > rightEdge) {
-      delta = cellRect.right - rightEdge;
-    }
-    if (delta !== 0) {
-      wrap.scrollLeft += delta;
-    }
+    if (target === null) return;
+
+    // 1. Ensure the target beat is inside the mounted window.
+    this.requestCellVisible(layerEl.id, subdivIndex);
+    this.mountCellWindow(layer, layerEl);
+
+    // 2. Only now does the grid span the full width, so the scroll sticks.
+    const freshWrap = layerEl.querySelector('.subdivision-scroll-wrap') || wrap;
+    freshWrap.scrollLeft = target;
+    wrap.scrollLeft = target;
+  }
+
+  // Ask for a specific beat to be included in the next cell window.
+  requestCellVisible(layerId, subdivIndex) {
+    const layer = this.state.layers.find((l) => l.id === layerId);
+    if (!layer || !this.isLayerExpanded(layerId)) return;
+    this.pendingCellIndex = this.pendingCellIndex || new Map();
+    this.pendingCellIndex.set(layerId, subdivIndex);
   }
 
   // ==========================================================================
@@ -1560,13 +1619,12 @@ class MetronomeApp {
     return card;
   }
 
-  // Header + controls only. No grouping tags, no subdivision cells.
+  // Header + controls only. No grouping tags, no subdivision cells, and no
+  // card-level wrapper: the caller owns .layer-main, so this fragment starts at
+  // the header bar. Returning another accent bar / .layer-main here used to
+  // nest a second copy inside the first.
   layerHeaderHtml(layer, index) {
     return `
-      <div class="layer-accent-bar" style="background: ${layer.color};"></div>
-      <div class="layer-main">
-
-        <!-- Top Header Bar -->
         <div class="layer-header-bar">
           <div class="layer-title-group">
             <span class="layer-tag" style="background: ${layer.color}22; color: ${layer.color};">#${index + 1}</span>
@@ -1620,7 +1678,6 @@ class MetronomeApp {
               ${this.state.layers.length > 1 ? '<button class="del-layer-btn" title="删除当前 Layer">✕</button>' : ''}
             </div>
           </div>
-        </div>
     `;
   }
 
@@ -1713,10 +1770,9 @@ class MetronomeApp {
 
   // --- Group tags -----------------------------------------------------------
   //
-  // Tags are a wrapping flex flow, so the whole list has a fixed measured
-  // height and items are ordered by row then column. Virtualising by item index
-  // keeps every mounting order simple; the spacers only need to reserve the
-  // height of the skipped rows.
+  // Tags wrap, so the layout unit is a ROW, not a single tag. Every window
+  // calculation below is done in rows and only converted to group indexes at
+  // the very end — mixing the two units was the original bug.
 
   mountGroupWindow(layer, card) {
     const host = card.querySelector('.groups-tags-list');
@@ -1724,38 +1780,51 @@ class MetronomeApp {
     // A real (viewport-driven) mount supersedes any minimal mount.
     host.__minimal = false;
 
-    const total = layer.groups.length;
+    const totalGroups = layer.groups.length;
     const geom = this.getGroupGeometry(host, layer);
     const perRow = geom.itemsPerRow;
+    const totalRows = Math.max(1, Math.ceil(totalGroups / perRow));
+
+    // Small lists mount in full; no virtualisation, no spacers.
+    if (totalGroups <= VIRTUAL_POLICY.fullRenderThreshold) {
+      host.innerHTML = '';
+      const all = document.createElement('div');
+      all.className = 'groups-tags-mounted';
+      const allParts = [];
+      for (let i = 0; i < totalGroups; i++) allParts.push(this.groupTagHtml(layer, i));
+      all.innerHTML = allParts.join('');
+      host.appendChild(all);
+      layer.__virtual = layer.__virtual || {};
+      layer.__virtual.groups = { start: 0, end: totalGroups };
+      return;
+    }
 
     const hostRect = this.rectOf(host);
     // Tags scroll with the page, so the visible slice is expressed in the
-    // list's own coordinate space.
-    const visible = computeVisibleRange({
-      total,
+    // list's own coordinate space. Units: rows.
+    const visibleRows = computeVisibleRange({
+      total: totalRows,
       viewportStart: -hostRect.top,
       viewportEnd: this.viewportHeight() - hostRect.top,
       itemSize: geom.rowHeight,
-      overscan: VIRTUAL_POLICY.overscanItems,
-      minItems: VIRTUAL_POLICY.minWindowItems,
+      overscan: VIRTUAL_POLICY.overscanRows,
+      minItems: VIRTUAL_POLICY.minGroupRows,
     });
-    const win = computeEffectiveWindow(total, visible);
 
-    // Convert the row-based window into an item index range, snapped to whole
-    // rows so the mounted block always wraps the same way as the full list.
-    const firstRow = Math.floor(win.start / perRow);
-    const lastRow = Math.ceil(win.end / perRow);
-    const start = Math.max(0, firstRow * perRow);
-    const end = Math.min(total, lastRow * perRow);
+    const startRow = Math.max(0, Math.min(totalRows, visibleRows.start));
+    const endRow = Math.max(startRow, Math.min(totalRows, visibleRows.end));
+
+    // Convert whole rows to group indexes. No second division by perRow.
+    const start = startRow * perRow;
+    const end = Math.min(totalGroups, endRow * perRow);
 
     const parts = [];
     for (let i = start; i < end; i++) {
       parts.push(this.groupTagHtml(layer, i));
     }
 
-    // Spacers are whole rows, which is what flex-wrap actually lays out.
-    const beforeRows = Math.floor(start / perRow);
-    const afterRows = Math.max(0, geom.totalRows - Math.ceil(end / perRow));
+    const beforeRows = startRow;
+    const afterRows = Math.max(0, totalRows - endRow);
     const beforeH = beforeRows * geom.rowHeight;
     const afterH = afterRows * geom.rowHeight;
 
@@ -1794,9 +1863,16 @@ class MetronomeApp {
     const total = layer.numerator;
     const geom = this.getCellGeometry(grid);
 
-    // The grid is a horizontal scroller inside the card.
+    // The grid is a horizontal scroller inside the card. The scroll position
+    // is taken from an explicit hand-off when a mount is triggered by playback
+    // following or by keyboard navigation, because the browser may not have
+    // applied a just-assigned scrollLeft yet.
     const wrapWidth = wrap && wrap.clientWidth ? wrap.clientWidth : this.viewportWidth();
-    const scrollLeft = wrap ? wrap.scrollLeft : 0;
+    let scrollLeft = wrap ? wrap.scrollLeft : 0;
+    if (layer.__pendingScrollLeft !== undefined && layer.__pendingScrollLeft !== null) {
+      scrollLeft = layer.__pendingScrollLeft;
+      layer.__pendingScrollLeft = null;
+    }
 
     const visible = computeVisibleRange({
       total,
@@ -1808,14 +1884,30 @@ class MetronomeApp {
     });
     const win = computeEffectiveWindow(total, visible);
 
+    // A pending focus/playhead request must be inside the mounted slice,
+    // otherwise the scroll maths and the DOM would disagree by one window.
+    // It is NOT cleared here: clearing is done only once the caller confirms
+    // the cell is mounted, because a stale scrollLeft (the browser clamps it
+    // to 0 while the grid is momentarily empty) can otherwise recompute a
+    // window that excludes the pending beat.
+    let start = win.start;
+    let end = win.end;
+    const pending = this.pendingCellIndex && this.pendingCellIndex.get(layer.id);
+    if (Number.isInteger(pending) && pending >= 0 && pending < total) {
+      if (pending < start) start = Math.max(0, pending - VIRTUAL_POLICY.overscanItems);
+      if (pending >= end) end = Math.min(total, pending + VIRTUAL_POLICY.overscanItems + 1);
+    }
+
     const starts = this.groupStartSet(layer);
     const parts = [];
-    for (let i = win.start; i < win.end; i++) {
+    for (let i = start; i < end; i++) {
       parts.push(this.subdivCellHtml(layer, i, starts));
     }
 
-    const beforeW = win.before * geom.itemWidth;
-    const afterW = win.after * geom.itemWidth;
+    // Every .subdiv-cell-wrap has a fixed pitch (see style.css), including
+    // group-start markers, so index * itemWidth is the exact layout width.
+    const beforeW = start * geom.itemWidth;
+    const afterW = Math.max(0, (total - end) * geom.itemWidth);
 
     grid.innerHTML = '';
     if (beforeW > 0) {
@@ -1837,8 +1929,13 @@ class MetronomeApp {
       grid.appendChild(spacer);
     }
 
+    // NOTE: scrollLeft is intentionally NOT restored here. Replacing the
+    // grid's children keeps the scroller's own position, and callers that
+    // need a specific offset (playback follow, keyboard focus) set it after
+    // this returns, when the full-width spacers exist.
+
     layer.__virtual = layer.__virtual || {};
-    layer.__virtual.cells = { start: win.start, end: win.end };
+    layer.__virtual.cells = { start, end };
     layer.__virtual.starts = starts;
   }
 
@@ -1875,14 +1972,150 @@ class MetronomeApp {
     const isPlayhead = this.currentPlayhead &&
       this.currentPlayhead.get(layer.id) === index &&
       this.state.isPlaying;
+
+    // Roving tabindex: exactly one cell per grid is a Tab stop, so the keyboard
+    // does not have to walk thousands of cells. The roving index is the shared
+    // logical cursor (this.gridCursor), which survives remounting.
+    const cursor = this.gridCursor && this.gridCursor.get(layer.id);
+    const isTabStop = cursor === undefined ? index === 0 : cursor === index;
+
+    const label = `第 ${index + 1} 拍：${type}`;
     return `
       <div class="subdiv-cell-wrap ${isGroupStart ? 'group-start' : ''}">
-        <div class="subdiv-cell ${type}${isPlayhead ? ' active-playhead' : ''}" data-index="${index}" title="第 ${index + 1} 拍：${type}">
-          <span class="cell-icon">${symbol}</span>
+        <div class="subdiv-cell ${type}${isPlayhead ? ' active-playhead' : ''}"
+             data-index="${index}"
+             tabindex="${isTabStop ? '0' : '-1'}"
+             role="button"
+             aria-label="${label}"
+             aria-pressed="${type === 'mute' ? 'false' : 'true'}"
+             title="${label}">
+          <span class="cell-icon" aria-hidden="true">${symbol}</span>
         </div>
-        <span class="cell-num">${index + 1}</span>
+        <span class="cell-num" aria-hidden="true">${index + 1}</span>
       </div>
     `;
+  }
+
+  // Cycle one beat and repaint just that cell.
+  toggleCell(layer, cell) {
+    const index = parseInt(cell.dataset.index, 10);
+    if (!Number.isInteger(index)) return;
+
+    const currentType = this.state.getBeatType(layer, index);
+    const nextType = this.state.cycleBeatType(currentType);
+    layer.overrides[index] = nextType;
+
+    this.paintCell(cell, index, nextType);
+  }
+
+  paintCell(cell, index, type) {
+    const wasPlayhead = cell.classList.contains('active-playhead');
+    cell.className = `subdiv-cell ${type}${wasPlayhead ? ' active-playhead' : ''}`;
+    const icon = cell.querySelector('.cell-icon');
+    if (icon) icon.textContent = type === 'accent' ? '●' : (type === 'mute' ? '×' : '○');
+    const label = `第 ${index + 1} 拍：${type}`;
+    cell.title = label;
+    if (cell.setAttribute) {
+      cell.setAttribute('aria-label', label);
+      cell.setAttribute('aria-pressed', type === 'mute' ? 'false' : 'true');
+    }
+  }
+
+  // Roving tabindex cursor: the logical index that owns the Tab stop.
+  setGridCursor(layer, index) {
+    this.gridCursor = this.gridCursor || new Map();
+    const previous = this.gridCursor.get(layer.id);
+    if (previous === index) return;
+    this.gridCursor.set(layer.id, index);
+
+    const card = document.getElementById(layer.id);
+    if (!card) return;
+    const grid = card.querySelector('.subdivision-grid');
+    if (!grid) return;
+    for (const el of grid.querySelectorAll('.subdiv-cell')) {
+      const i = parseInt(el.dataset.index, 10);
+      el.tabIndex = i === index ? 0 : -1;
+    }
+  }
+
+  handleGridKeydown(e, layer, cell) {
+    const index = parseInt(cell.dataset.index, 10);
+    if (!Number.isInteger(index)) return;
+
+    const total = layer.numerator;
+    let target = null;
+
+    switch (e.key) {
+      case 'ArrowRight':
+        target = Math.min(total - 1, index + 1);
+        break;
+      case 'ArrowLeft':
+        target = Math.max(0, index - 1);
+        break;
+      case 'Home':
+        target = 0;
+        break;
+      case 'End':
+        target = total - 1;
+        break;
+      case 'Enter':
+      case ' ':
+        e.preventDefault();
+        this.toggleCell(layer, cell);
+        return;
+      default:
+        return;
+    }
+
+    e.preventDefault();
+    this.focusCell(layer, target);
+  }
+
+  /**
+   * Move keyboard focus to a logical beat index, mounting it first if the
+   * virtual window does not currently include it.
+   *
+   * The scroll position is derived from geometry, so it works while the target
+   * cell does not exist yet; the pending index then forces the next mount to
+   * include it before focus is applied.
+   */
+  focusCell(layer, index) {
+    if (!Number.isInteger(index) || index < 0 || index >= layer.numerator) return;
+
+    this.gridCursor = this.gridCursor || new Map();
+    this.gridCursor.set(layer.id, index);
+
+    const card = document.getElementById(layer.id);
+    if (!card) return;
+    const wrap = card.querySelector('.subdivision-scroll-wrap');
+    const grid = card.querySelector('.subdivision-grid');
+    if (!wrap || !grid) return;
+
+    const geom = this.getCellGeometry(grid);
+    const pitch = geom.itemWidth;
+    const viewWidth = wrap.clientWidth || 0;
+
+    // Bring the target into the horizontal band before asking for a mount.
+    if (pitch > 0 && viewWidth > 0) {
+      const cellLeft = index * pitch;
+      const cellRight = cellLeft + pitch;
+      if (cellLeft < wrap.scrollLeft) {
+        wrap.scrollLeft = cellLeft;
+      } else if (cellRight > wrap.scrollLeft + viewWidth) {
+        wrap.scrollLeft = cellRight - viewWidth;
+      }
+    }
+
+    this.pendingCellIndex = this.pendingCellIndex || new Map();
+    this.pendingCellIndex.set(layer.id, index);
+    this.mountCellWindow(layer, card);
+
+    const target = grid.querySelector(`.subdiv-cell[data-index="${index}"]`);
+    if (target) {
+      this.pendingCellIndex.delete(layer.id);
+      if (typeof target.focus === 'function') target.focus();
+      this.setGridCursor(layer, index);
+    }
   }
 
   // --- Geometry -------------------------------------------------------------
@@ -1907,33 +2140,54 @@ class MetronomeApp {
     return Number.isFinite(w) && w > 0 ? w : 1280;
   }
 
-  // Measured tag geometry, cached on the layer so scrolling does not remeasure.
-  // Tags wrap, so the unit of layout is a row: how many fit per line and how
-  // tall each line is.
+  // Measured tag geometry.
+  //
+  // Tags differ in width: the first has no left-move button and the last has
+  // no right-move button, so measuring only one tag would be wrong. Instead the
+  // geometry deliberately uses a FIXED column model derived from the widest
+  // tag, which makes wrapping identical for every row and therefore exactly
+  // predictable for the spacers.
+  //
+  // A fallback result is never cached permanently: `measured` records whether
+  // real elements were available, and a later call re-measures once they are.
   getGroupGeometry(host, layer) {
     const cached = host.__geom;
-    if (cached && cached.rowHeight > 0 && cached.itemsPerRow > 0) return cached;
+    if (cached && cached.measured) return cached;
 
     const total = layer ? layer.groups.length : (host.querySelectorAll('.group-tag').length || 1);
 
     let itemWidth = VIRTUAL_POLICY.fallbackTagWidth;
     let rowHeight = VIRTUAL_POLICY.fallbackTagHeight;
+    let measured = false;
 
-    const first = host.querySelector('.group-tag');
-    if (first) {
-      const r = this.rectOf(first);
-      if (r.width > 0) itemWidth = r.width + 8;   // flex column gap
-      if (r.height > 0) rowHeight = r.height + 8; // flex row gap
+    // Measure up to three tags and take the widest: the button count varies
+    // between the first, middle and last tag.
+    const tags = host.querySelectorAll('.group-tag');
+    if (tags.length > 0) {
+      let maxW = 0;
+      let maxH = 0;
+      const sample = Math.min(3, tags.length);
+      for (let i = 0; i < sample; i++) {
+        const r = this.rectOf(tags[i]);
+        if (r.width > maxW) maxW = r.width;
+        if (r.height > maxH) maxH = r.height;
+      }
+      if (maxW > 0) {
+        itemWidth = maxW + 8;   // flex column gap
+        measured = true;
+      }
+      if (maxH > 0) rowHeight = maxH + 8; // flex row gap
     }
 
-    const availWidth = host.clientWidth || this.viewportWidth() - 80;
+    const availWidth = host.clientWidth || (this.viewportWidth() - 80);
     const itemsPerRow = Math.max(1, Math.floor(availWidth / itemWidth));
 
     const geom = {
       itemWidth,
       rowHeight,
       itemsPerRow,
-      totalRows: Math.ceil(total / itemsPerRow),
+      totalRows: Math.max(1, Math.ceil(total / itemsPerRow)),
+      measured,
     };
     host.__geom = geom;
     return geom;
@@ -1941,33 +2195,72 @@ class MetronomeApp {
 
   getCellGeometry(grid) {
     const cached = grid.__geom;
-    if (cached && cached.itemWidth > 0) return cached;
+    if (cached && cached.measured) return cached;
 
     const first = grid.querySelector('.subdiv-cell-wrap');
     let itemWidth = VIRTUAL_POLICY.fallbackCellWidth;
+    let measured = false;
     if (first) {
       const r = this.rectOf(first);
-      if (r.width > 0) itemWidth = r.width + 2; // flex gap
+      if (r.width > 0) {
+        itemWidth = r.width + 2; // flex gap
+        measured = true;
+      }
     }
-    const geom = { itemWidth };
+    const geom = { itemWidth, measured };
     grid.__geom = geom;
     return geom;
   }
 
+  // Drop cached geometry so the next mount re-measures. Called when a
+  // container's real size changes (window resize, responsive breakpoint).
+  invalidateLayerGeometry(layerId) {
+    const card = document.getElementById(layerId);
+    if (!card) return;
+    const tagsHost = card.querySelector('.groups-tags-list');
+    if (tagsHost) tagsHost.__geom = null;
+    const grid = card.querySelector('.subdivision-grid');
+    if (grid) grid.__geom = null;
+  }
+
   // Observe the two virtual hosts of one layer. Recreated whenever the detail
   // DOM is rebuilt; torn down when the layer collapses or is removed.
+  //
+  // The callback only reacts to a change in the HOST's own width: mounting more
+  // tags changes the host's height, and reacting to that would re-trigger the
+  // observer forever. Width is what determines wrapping, so it is the signal
+  // worth invalidation on.
   attachLayerVirtualObserver(layer, card) {
     this.detachLayerVirtualObserver(layer.id);
     if (typeof ResizeObserver !== 'function') return;
 
     const tagsHost = card.querySelector('.groups-tags-list');
-    const grid = card.querySelector('.subdivision-grid');
     const wrap = card.querySelector('.subdivision-scroll-wrap');
-    if (!tagsHost && !grid) return;
+    if (!tagsHost && !wrap) return;
 
-    const observer = new ResizeObserver(() => this.scheduleVirtualRefresh(layer.id));
+    const lastWidths = new Map();
+
+    const observer = new ResizeObserver((entries) => {
+      let widthChanged = false;
+      for (const entry of entries) {
+        const box = entry.contentRect || {};
+        const width = Math.round(box.width || 0);
+        const prev = lastWidths.get(entry.target);
+        if (prev === undefined) {
+          lastWidths.set(entry.target, width);
+          continue;
+        }
+        if (width !== prev) {
+          lastWidths.set(entry.target, width);
+          widthChanged = true;
+        }
+      }
+      if (!widthChanged) return;
+      this.invalidateLayerGeometry(layer.id);
+      this.scheduleVirtualRefresh(layer.id);
+    });
+
     if (tagsHost) observer.observe(tagsHost);
-    if (grid) observer.observe(grid);
     if (wrap) observer.observe(wrap);
 
     this.virtualObservers.set(layer.id, observer);
@@ -2054,38 +2347,23 @@ class MetronomeApp {
     }
   }
 
-  // Smallest mount that still keeps the list's geometry: a handful of rows for
-  // tags, a handful of cells for the grid, with spacers for the rest.
+  // Off-screen mount: reserve the full geometry with a single spacer and mount
+  // no content at all. Keeping a couple of rows mounted would multiply across
+  // 64 expanded layers; a pure spacer keeps the scroll height and width exactly
+  // while costing one node. The layer is rebuilt as soon as it scrolls back in.
   renderMinimalGroupWindow(layer, card) {
     const host = card.querySelector('.groups-tags-list');
     if (!host) return;
-    const total = layer.groups.length;
     const geom = this.getGroupGeometry(host, layer);
-    const perRow = geom.itemsPerRow;
 
-    const mountRows = 2;
-    const end = Math.min(total, perRow * mountRows);
-
-    const parts = [];
-    for (let i = 0; i < end; i++) parts.push(this.groupTagHtml(layer, i));
-
-    const afterRows = Math.max(0, geom.totalRows - mountRows);
     host.innerHTML = '';
-
-    const row = document.createElement('div');
-    row.className = 'groups-tags-mounted';
-    row.innerHTML = parts.join('');
-    host.appendChild(row);
-
-    if (afterRows > 0) {
-      const spacer = document.createElement('div');
-      spacer.className = 'virtual-spacer';
-      spacer.style.height = `${afterRows * geom.rowHeight}px`;
-      host.appendChild(spacer);
-    }
+    const spacer = document.createElement('div');
+    spacer.className = 'virtual-spacer';
+    spacer.style.height = `${geom.totalRows * geom.rowHeight}px`;
+    host.appendChild(spacer);
 
     layer.__virtual = layer.__virtual || {};
-    layer.__virtual.groups = { start: 0, end };
+    layer.__virtual.groups = { start: 0, end: 0 };
   }
 
   renderMinimalCellWindow(layer, card) {
@@ -2094,29 +2372,14 @@ class MetronomeApp {
     const total = layer.numerator;
     const geom = this.getCellGeometry(grid);
 
-    const mountCount = Math.min(total, VIRTUAL_POLICY.minWindowItems);
-    const starts = this.groupStartSet(layer);
-
-    const parts = [];
-    for (let i = 0; i < mountCount; i++) parts.push(this.subdivCellHtml(layer, i, starts));
-
-    const afterW = Math.max(0, (total - mountCount) * geom.itemWidth);
     grid.innerHTML = '';
-
-    const band = document.createElement('div');
-    band.className = 'subdiv-cells-mounted';
-    band.innerHTML = parts.join('');
-    grid.appendChild(band);
-
-    if (afterW > 0) {
-      const spacer = document.createElement('div');
-      spacer.className = 'virtual-spacer-h';
-      spacer.style.width = `${afterW}px`;
-      grid.appendChild(spacer);
-    }
+    const spacer = document.createElement('div');
+    spacer.className = 'virtual-spacer-h';
+    spacer.style.width = `${total * geom.itemWidth}px`;
+    grid.appendChild(spacer);
 
     layer.__virtual = layer.__virtual || {};
-    layer.__virtual.cells = { start: 0, end: mountCount };
+    layer.__virtual.cells = { start: 0, end: 0 };
   }
 
   // Refresh only the cheap derived bits of a card (summary + badge), leaving
@@ -2168,11 +2431,40 @@ class MetronomeApp {
 
     if (expanded) {
       this.renderLayerDetail(layer, card);
+      // Expanding many layers at once (the "expand all" case) would otherwise
+      // mount full detail for every card before any scroll happened. Decide
+      // immediately whether this card is actually on screen.
+      this.settleLayerWindow(layerId, card);
     } else {
       // Release the detail DOM entirely; state is unaffected. The observer is
       // torn down too, so a collapsed layer keeps no live watchers.
       this.detachLayerVirtualObserver(layerId);
       host.replaceChildren();
+    }
+  }
+
+  // Mount the real window when the card is near the viewport, or the pure
+  // spacer representation when it is far away.
+  settleLayerWindow(layerId, card) {
+    const r = this.rectOf(card);
+    const vh = this.viewportHeight();
+    const measurable = r.height > 0;
+
+    if (measurable) {
+      const onScreen = !(r.bottom < -vh || r.top > vh * 2);
+      if (onScreen) this.scheduleVirtualRefresh(layerId);
+      else this.collapseVirtualWindow(layerId);
+      return;
+    }
+
+    // No layout information (first paint, or a non-layout environment). Only
+    // the first few cards keep a full window; the rest fall back to spacers so
+    // a large "expand all" cannot blow up the DOM before any scroll happens.
+    const index = this.state.layers.findIndex((l) => l.id === layerId);
+    if (index >= 0 && index < 3) {
+      this.scheduleVirtualRefresh(layerId);
+    } else {
+      this.collapseVirtualWindow(layerId);
     }
   }
 
@@ -2394,21 +2686,26 @@ class MetronomeApp {
     const grid = card.querySelector('.subdivision-grid');
     if (grid && !grid.dataset.bound) {
       grid.dataset.bound = '1';
-      grid.addEventListener('click', (e) => {
-        const cell = e.target.closest('.subdiv-cell');
+
+      // Keep the roving-tabindex cursor in sync with real focus.
+      grid.addEventListener('focusin', (e) => {
+        const cell = e.target.closest && e.target.closest('.subdiv-cell');
         if (!cell) return;
         const index = parseInt(cell.dataset.index, 10);
         if (!Number.isInteger(index)) return;
+        this.setGridCursor(layer, index);
+      });
 
-        const currentType = this.state.getBeatType(layer, index);
-        const nextType = this.state.cycleBeatType(currentType);
-        layer.overrides[index] = nextType;
+      grid.addEventListener('keydown', (e) => {
+        const cell = e.target.closest && e.target.closest('.subdiv-cell');
+        if (!cell) return;
+        this.handleGridKeydown(e, layer, cell);
+      });
 
-        // Immediate visual update of the single cell that changed.
-        cell.className = `subdiv-cell ${nextType}`;
-        const icon = cell.querySelector('.cell-icon');
-        if (icon) icon.textContent = nextType === 'accent' ? '●' : (nextType === 'mute' ? '×' : '○');
-        cell.title = `第 ${index + 1} 拍：${nextType}`;
+      grid.addEventListener('click', (e) => {
+        const cell = e.target.closest('.subdiv-cell');
+        if (!cell) return;
+        this.toggleCell(layer, cell);
       });
     }
 
