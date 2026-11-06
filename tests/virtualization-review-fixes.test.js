@@ -333,7 +333,7 @@ test('follow: scheduling is unaffected by follow/mount work', () => {
 // 3. Geometry cache and resize
 // ===========================================================================
 
-test('geometry: a fallback result is not treated as a final measurement', () => {
+test('geometry: fallback geometry is replaced by a real measurement once nodes exist', () => {
   const { app, limits } = newApp();
   const a = loadOne(limits);
   const layer = a.state.layers[0];
@@ -341,14 +341,31 @@ test('geometry: a fallback result is not treated as a final measurement', () => 
 
   const card = a.document.getElementById(layer.id);
   const host = card.querySelector('.groups-tags-list');
-  // The harness reports zero-sized rects, so this geometry is a fallback.
-  assert.equal(host.__geom.measured, false, 'flagged as fallback');
 
-  // Force a measured value, as a real browser would after mount.
-  host.__geom = { itemWidth: 120, rowHeight: 44, itemsPerRow: 8, totalRows: 128, measured: true };
-  const geom = a.getGroupGeometry(host, layer);
-  assert.equal(geom.measured, true);
-  assert.equal(geom.itemsPerRow, 8);
+  // Start from an EMPTY host: the first call has nothing to measure, so it
+  // must report a fallback rather than inventing a measurement.
+  host.innerHTML = '';
+  host.__geom = null;
+  host.clientWidth = 500;
+  const fallback = a.getGroupGeometry(host, layer);
+  assert.equal(fallback.measured, false, 'empty DOM yields a fallback');
+  assert.equal(fallback.itemWidth, loadApp().api.VIRTUAL_POLICY.fallbackTagWidth);
+
+  // Now mount real tags and give them real geometry, as the browser's layout
+  // would. The next call must actually measure them, not return the cached
+  // fallback.
+  host.innerHTML = '<div class="group-tag"></div><div class="group-tag"></div>';
+  const tags = list(host.querySelectorAll('.group-tag'));
+  for (const tag of tags) {
+    tag.getBoundingClientRect = () => ({
+      width: 106, height: 30, top: 0, left: 0, bottom: 30, right: 106,
+    });
+  }
+
+  const measured = a.getGroupGeometry(host, layer);
+  assert.equal(measured.measured, true, 'second call measured the real nodes');
+  assert.equal(measured.itemWidth, 114, '106px tag plus 8px flex gap');
+  assert.ok(measured.itemsPerRow >= 1);
 });
 
 test('geometry: invalidateLayerGeometry drops the cache', () => {
@@ -421,20 +438,56 @@ function spacerRowsOf(host, rowHeight) {
   return rows;
 }
 
-test('geometry: height-only changes do not invalidate', () => {
-  const { app, limits } = newApp();
-  const a = loadOne(limits);
-  const layer = a.state.layers[0];
-  a.setLayerExpanded(layer.id, true);
-  const card = a.document.getElementById(layer.id);
+test('geometry: a real ResizeObserver callback invalidates on width, not height', () => {
+  const harness = loadApp({ resizeObserver: {} });
+  const app = createApp(harness, { now: 0 });
+  const limits = harness.api.METRONOME_LIMITS;
+
+  app.loadPresetData({ name: 'x', bpm: 120, layers: [bigLayer(limits)] });
+  const layer = app.state.layers[0];
+  app.setLayerExpanded(layer.id, true);
+
+  const card = app.document.getElementById(layer.id);
   const host = card.querySelector('.groups-tags-list');
+  const wrap = card.querySelector('.subdivision-scroll-wrap');
+
+  // Re-attach with our injected stub so the callback is captured.
+  app.attachLayerVirtualObserver(layer, card);
+  const observed = harness.observedTargets;
+  assert.ok(observed.includes(host), 'group host is observed');
+  assert.ok(observed.includes(wrap), 'pattern scroller is observed');
+
   host.__geom = { itemWidth: 100, rowHeight: 40, itemsPerRow: 4, totalRows: 256, measured: true };
 
-  // The observer only reacts to width; a height change is what mounting more
-  // rows causes, so reacting to it would loop forever.
-  const before = host.__geom;
-  a.invalidateLayerGeometry; // no height path exists by design
-  assert.equal(host.__geom, before, 'height changes alone do not clear geometry');
+  // First observation records the baseline width; no invalidation yet.
+  harness.fireResize([
+    { target: host, contentRect: { width: 500, height: 300 } },
+    { target: wrap, contentRect: { width: 1190, height: 60 } },
+  ]);
+  assert.ok(host.__geom, 'initial width does not invalidate');
+
+  // Height-only change must NOT invalidate: mounting more rows changes the
+  // host's height, and reacting to that would re-trigger the observer forever.
+  harness.fireResize([
+    { target: host, contentRect: { width: 500, height: 900 } },
+  ]);
+  assert.ok(host.__geom, 'height-only change is ignored');
+
+  // A width change invalidates the group host and schedules a group refresh.
+  harness.fireResize([
+    { target: host, contentRect: { width: 1000, height: 900 } },
+  ]);
+  assert.equal(host.__geom, null, 'group width change invalidates geometry');
+  assert.equal(app.virtualRefreshQueued.get(layer.id), 'groups',
+    'only the group window is queued');
+
+  // A pattern-scroller width change targets the cells instead.
+  app.virtualRefreshQueued.delete(layer.id);
+  harness.fireResize([
+    { target: wrap, contentRect: { width: 800, height: 60 } },
+  ]);
+  assert.equal(app.virtualRefreshQueued.get(layer.id), 'cells',
+    'pattern width change refreshes only cells');
 });
 
 // ===========================================================================

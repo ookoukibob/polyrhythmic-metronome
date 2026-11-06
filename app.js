@@ -1066,14 +1066,15 @@ class MetronomeApp {
       window.addEventListener('resize', onScroll, { passive: true });
     }
 
-    // The pattern grid scrolls horizontally inside its own wrapper.
+    // The pattern grid scrolls horizontally inside its own wrapper. That must
+    // not rebuild the group tags above it, so only the cell window refreshes.
     if (this.dom.layersList && this.dom.layersList.addEventListener) {
       this.dom.layersList.addEventListener('scroll', (e) => {
         const wrap = e.target && e.target.closest && e.target.closest('.subdivision-scroll-wrap');
         if (!wrap) return;
         const card = wrap.closest('.layer-card');
         if (!card || !card.id) return;
-        this.scheduleVirtualRefresh(card.id);
+        this.scheduleVirtualRefresh(card.id, 'cells');
       }, { passive: true, capture: true });
     }
   }
@@ -1376,9 +1377,11 @@ class MetronomeApp {
     }
     if (target === null) return;
 
-    // 1. Ensure the target beat is inside the mounted window.
+    // 1. Ensure the target beat is inside the mounted window. Use the focus-
+    //    aware refresh path: a directly mounted cell would destroy a focused
+    //    cell without restoring it when playback follows across windows.
     this.requestCellVisible(layerEl.id, subdivIndex);
-    this.mountCellWindow(layer, layerEl);
+    this.refreshLayerVirtualWindows(layerEl.id, 'cells');
 
     // 2. Only now does the grid span the full width, so the scroll sticks.
     const freshWrap = layerEl.querySelector('.subdivision-scroll-wrap') || wrap;
@@ -1774,6 +1777,42 @@ class MetronomeApp {
   // calculation below is done in rows and only converted to group indexes at
   // the very end — mixing the two units was the original bug.
 
+  /**
+   * Decide whether a host already represents the requested window.
+   *
+   * Scrolling produces a refresh per frame, but the mounted slice only changes
+   * when the range actually moves. Rebuilding identical content throws away
+   * focused inputs and cells and churns the DOM, so an identical window is a
+   * no-op. `sig` carries every quantity that affects the rendered result:
+   * range, geometry and any data revision, so a real change can never be
+   * skipped.
+   */
+  windowIsCurrent(host, sig) {
+    const prev = host.__windowSig;
+    if (!prev) return false;
+    if (prev.kind !== sig.kind) return false;
+    if (prev.start !== sig.start || prev.end !== sig.end) return false;
+    if (prev.geom !== sig.geom) return false;
+    if (prev.rev !== sig.rev) return false;
+    if (prev.minimal !== sig.minimal) return false;
+    // Cell windows additionally depend on the playhead, the roving cursor and
+    // any pending focus/follow request.
+    if (prev.playhead !== sig.playhead) return false;
+    if (prev.cursor !== sig.cursor) return false;
+    if (prev.pending !== sig.pending) return false;
+    return true;
+  }
+
+  markWindowCurrent(host, sig) {
+    host.__windowSig = sig;
+  }
+
+  // Bumped whenever anything that affects rendered content changes outside the
+  // window range (groups edited, layer data replaced, sources toggled).
+  bumpLayerDataRevision(layer) {
+    layer.__dataRev = (layer.__dataRev || 0) + 1;
+  }
+
   mountGroupWindow(layer, card) {
     const host = card.querySelector('.groups-tags-list');
     if (!host) return;
@@ -1787,6 +1826,16 @@ class MetronomeApp {
 
     // Small lists mount in full; no virtualisation, no spacers.
     if (totalGroups <= VIRTUAL_POLICY.fullRenderThreshold) {
+      const sig = {
+        kind: 'groups-full',
+        start: 0,
+        end: totalGroups,
+        geom: `full|${totalGroups}|${perRow}`,
+        rev: layer.__dataRev || 0,
+        minimal: false,
+      };
+      if (this.windowIsCurrent(host, sig)) return;
+
       host.innerHTML = '';
       const all = document.createElement('div');
       all.className = 'groups-tags-mounted';
@@ -1796,6 +1845,7 @@ class MetronomeApp {
       host.appendChild(all);
       layer.__virtual = layer.__virtual || {};
       layer.__virtual.groups = { start: 0, end: totalGroups };
+      this.markWindowCurrent(host, sig);
       return;
     }
 
@@ -1817,6 +1867,16 @@ class MetronomeApp {
     // Convert whole rows to group indexes. No second division by perRow.
     const start = startRow * perRow;
     const end = Math.min(totalGroups, endRow * perRow);
+
+    const sig = {
+      kind: 'groups-virtual',
+      start,
+      end,
+      geom: `${perRow}|${Math.round(geom.rowHeight)}|${Math.round(geom.itemWidth)}`,
+      rev: layer.__dataRev || 0,
+      minimal: false,
+    };
+    if (this.windowIsCurrent(host, sig)) return;
 
     const parts = [];
     for (let i = start; i < end; i++) {
@@ -1850,6 +1910,7 @@ class MetronomeApp {
 
     layer.__virtual = layer.__virtual || {};
     layer.__virtual.groups = { start, end };
+    this.markWindowCurrent(host, sig);
   }
 
   // --- Pattern cells --------------------------------------------------------
@@ -1896,9 +1957,29 @@ class MetronomeApp {
     if (Number.isInteger(pending) && pending >= 0 && pending < total) {
       if (pending < start) start = Math.max(0, pending - VIRTUAL_POLICY.overscanItems);
       if (pending >= end) end = Math.min(total, pending + VIRTUAL_POLICY.overscanItems + 1);
+      // The window now guarantees the target is mounted; the request is
+      // satisfied. Clearing here keeps the steady-state signature stable.
+      if (this.pendingCellIndex) this.pendingCellIndex.delete(layer.id);
     }
 
     const starts = this.groupStartSet(layer);
+    const sig = {
+      kind: 'cells',
+      start,
+      end,
+      geom: `${Math.round(geom.itemWidth)}|${total}`,
+      rev: layer.__dataRev || 0,
+      minimal: false,
+      playhead: this.state.isPlaying ? (this.currentPlayhead && this.currentPlayhead.get(layer.id)) : null,
+      cursor: this.gridCursor && this.gridCursor.get(layer.id),
+      // A pending request means the caller expects the target beat to be
+      // mounted on THIS pass; an otherwise identical signature must not skip it.
+      // It is a boolean trigger, not part of the steady-state signature, so
+      // clearing the pending map after the mount does not force a second rebuild.
+      pending: (this.pendingCellIndex && this.pendingCellIndex.has(layer.id)) ? 1 : 0,
+    };
+    if (this.windowIsCurrent(grid, sig)) return;
+
     const parts = [];
     for (let i = start; i < end; i++) {
       parts.push(this.subdivCellHtml(layer, i, starts));
@@ -1937,6 +2018,7 @@ class MetronomeApp {
     layer.__virtual = layer.__virtual || {};
     layer.__virtual.cells = { start, end };
     layer.__virtual.starts = starts;
+    this.markWindowCurrent(grid, sig);
   }
 
   groupStartSet(layer) {
@@ -1949,15 +2031,19 @@ class MetronomeApp {
     return starts;
   }
 
+  // Every tag carries the same two move buttons so the flex row wraps at a
+  // uniform pitch. At the boundaries the button that cannot act is rendered
+  // disabled rather than omitted: omitting it made the first and last tag
+  // narrower, so the virtual row model disagreed with the real layout.
   groupTagHtml(layer, gIdx) {
     const val = layer.groups[gIdx];
     const isFirst = gIdx === 0;
     const isLast = gIdx === layer.groups.length - 1;
     return (
       `<div class="group-tag" data-gidx="${gIdx}">` +
-        (isFirst ? '' : '<button class="group-tag-btn group-move-left" title="左移">◀</button>') +
+        `<button class="group-tag-btn group-move-left" title="左移"${isFirst ? ' disabled' : ''}>◀</button>` +
         `<input type="number" class="group-tag-val" min="1" max="512" value="${val}">` +
-        (isLast ? '' : '<button class="group-tag-btn group-move-right" title="右移">▶</button>') +
+        `<button class="group-tag-btn group-move-right" title="右移"${isLast ? ' disabled' : ''}>▶</button>` +
         '<button class="group-tag-btn group-tag-del" title="删除该组">×</button>' +
       '</div>'
     );
@@ -2241,7 +2327,8 @@ class MetronomeApp {
     const lastWidths = new Map();
 
     const observer = new ResizeObserver((entries) => {
-      let widthChanged = false;
+      let groupWidthChanged = false;
+      let cellWidthChanged = false;
       for (const entry of entries) {
         const box = entry.contentRect || {};
         const width = Math.round(box.width || 0);
@@ -2250,14 +2337,17 @@ class MetronomeApp {
           lastWidths.set(entry.target, width);
           continue;
         }
-        if (width !== prev) {
-          lastWidths.set(entry.target, width);
-          widthChanged = true;
-        }
+        if (width === prev) continue;
+        lastWidths.set(entry.target, width);
+        if (tagsHost && entry.target === tagsHost) groupWidthChanged = true;
+        if (wrap && entry.target === wrap) cellWidthChanged = true;
       }
-      if (!widthChanged) return;
+      if (!groupWidthChanged && !cellWidthChanged) return;
       this.invalidateLayerGeometry(layer.id);
-      this.scheduleVirtualRefresh(layer.id);
+      const target = groupWidthChanged && cellWidthChanged
+        ? 'both'
+        : (groupWidthChanged ? 'groups' : 'cells');
+      this.scheduleVirtualRefresh(layer.id, target);
     });
 
     if (tagsHost) observer.observe(tagsHost);
@@ -2279,13 +2369,22 @@ class MetronomeApp {
   }
 
   // Coalesce many resize/scroll signals into one rAF-batched remount per layer.
-  scheduleVirtualRefresh(layerId) {
-    if (this.virtualRefreshQueued.has(layerId)) return;
-    this.virtualRefreshQueued.set(layerId, true);
+  // `target` narrows the work: 'both' (default), 'groups' or 'cells'. Horizontal
+  // pattern scrolling asks for 'cells' only, so the group tags are never
+  // rebuilt by a sideways scroll.
+  scheduleVirtualRefresh(layerId, target = 'both') {
+    const existing = this.virtualRefreshQueued.get(layerId);
+    if (existing) {
+      // Widen a pending narrow refresh rather than queueing a second one.
+      if (existing !== target) this.virtualRefreshQueued.set(layerId, 'both');
+      return;
+    }
+    this.virtualRefreshQueued.set(layerId, target);
 
     const run = () => {
+      const what = this.virtualRefreshQueued.get(layerId) || 'both';
       this.virtualRefreshQueued.delete(layerId);
-      this.refreshLayerVirtualWindows(layerId);
+      this.refreshLayerVirtualWindows(layerId, what);
     };
 
     if (typeof requestAnimationFrame === 'function') {
@@ -2295,14 +2394,117 @@ class MetronomeApp {
     }
   }
 
-  refreshLayerVirtualWindows(layerId) {
+  refreshLayerVirtualWindows(layerId, target = 'both') {
     const layer = this.state.layers.find((l) => l.id === layerId);
     if (!layer || !this.isLayerExpanded(layerId)) return;
     const card = document.getElementById(layerId);
     if (!card) return;
 
-    this.mountGroupWindow(layer, card);
-    this.mountCellWindow(layer, card);
+    // Rebinding destroys the nodes that currently hold focus. Capture the
+    // logical identity first, and restore it afterwards if the focused node is
+    // the one being replaced.
+    const focus = this.captureVirtualFocus(card);
+
+    if (target !== 'cells') this.mountGroupWindow(layer, card);
+    if (target !== 'groups') this.mountCellWindow(layer, card);
+
+    if (focus) this.restoreVirtualFocus(layer, card, focus);
+  }
+
+  /**
+   * Describe the focused element inside a card in logical terms, so it can be
+   * found again after the window is rebuilt.
+   *
+   * Returns null when nothing inside this card holds focus — an unrelated
+   * control must never lose focus because a virtual window refreshed.
+   */
+  captureVirtualFocus(card) {
+    const doc = (typeof document !== 'undefined') ? document : null;
+    const active = doc && doc.activeElement;
+    if (!active || !card) return null;
+    if (active === card) return null;
+
+    // Only handle descendants of this card.
+    let node = active;
+    let inside = false;
+    while (node) {
+      if (node === card) { inside = true; break; }
+      node = node.parentNode;
+    }
+    if (!inside) return null;
+
+    const cell = active.closest && active.closest('.subdiv-cell');
+    if (cell) {
+      const index = parseInt(cell.dataset.index, 10);
+      if (!Number.isInteger(index)) return null;
+      return { kind: 'cell', index };
+    }
+
+    const tag = active.closest && active.closest('.group-tag');
+    if (tag) {
+      const gIdx = parseInt(tag.dataset.gidx, 10);
+      if (!Number.isInteger(gIdx)) return null;
+      if (active.classList && active.classList.contains('group-tag-val')) {
+        return {
+          kind: 'group-input',
+          gidx: gIdx,
+          value: active.value,
+          selStart: typeof active.selectionStart === 'number' ? active.selectionStart : null,
+          selEnd: typeof active.selectionEnd === 'number' ? active.selectionEnd : null,
+        };
+      }
+      const btn = active.classList && (
+        active.classList.contains('group-move-left') ? 'left'
+          : active.classList.contains('group-move-right') ? 'right'
+            : active.classList.contains('group-tag-del') ? 'del' : null
+      );
+      if (btn) return { kind: 'group-button', gidx: gIdx, button: btn };
+    }
+
+    return null;
+  }
+
+  restoreVirtualFocus(layer, card, focus) {
+    if (focus.kind === 'cell') {
+      const cell = card.querySelector(`.subdiv-cell[data-index="${focus.index}"]`);
+      if (!cell || typeof cell.focus !== 'function') return;
+      cell.focus();
+      this.setGridCursor(layer, focus.index);
+      return;
+    }
+
+    if (focus.kind === 'group-input') {
+      const tag = this.findMountedTag(card, focus.gidx);
+      if (!tag) return;
+      const input = tag.querySelector('.group-tag-val');
+      if (!input) return;
+      // The value lives in state; only restore the caret the user had.
+      input.focus();
+      if (focus.selStart !== null && typeof input.setSelectionRange === 'function') {
+        try {
+          input.setSelectionRange(focus.selStart, focus.selEnd === null ? focus.selStart : focus.selEnd);
+        } catch (e) {
+          // Number inputs reject setSelectionRange in some engines.
+        }
+      }
+      return;
+    }
+
+    if (focus.kind === 'group-button') {
+      const tag = this.findMountedTag(card, focus.gidx);
+      if (!tag) return;
+      const cls = focus.button === 'left' ? '.group-move-left'
+        : focus.button === 'right' ? '.group-move-right' : '.group-tag-del';
+      const btn = tag.querySelector(cls);
+      if (btn && typeof btn.focus === 'function' && !btn.disabled) btn.focus();
+    }
+  }
+
+  findMountedTag(card, gIdx) {
+    for (const tag of card.querySelectorAll('.group-tag')) {
+      if (parseInt(tag.dataset.gidx, 10) === gIdx) return tag;
+    }
+    return null;
   }
 
   // Called once per animation frame while the page scrolls: refresh only the
@@ -2356,6 +2558,16 @@ class MetronomeApp {
     if (!host) return;
     const geom = this.getGroupGeometry(host, layer);
 
+    const sig = {
+      kind: 'groups-minimal',
+      start: 0,
+      end: 0,
+      geom: `${Math.round(geom.totalRows * geom.rowHeight)}`,
+      rev: layer.__dataRev || 0,
+      minimal: true,
+    };
+    if (this.windowIsCurrent(host, sig)) return;
+
     host.innerHTML = '';
     const spacer = document.createElement('div');
     spacer.className = 'virtual-spacer';
@@ -2364,6 +2576,7 @@ class MetronomeApp {
 
     layer.__virtual = layer.__virtual || {};
     layer.__virtual.groups = { start: 0, end: 0 };
+    this.markWindowCurrent(host, sig);
   }
 
   renderMinimalCellWindow(layer, card) {
@@ -2371,6 +2584,16 @@ class MetronomeApp {
     if (!grid) return;
     const total = layer.numerator;
     const geom = this.getCellGeometry(grid);
+
+    const sig = {
+      kind: 'cells-minimal',
+      start: 0,
+      end: 0,
+      geom: `${Math.round(total * geom.itemWidth)}|${total}`,
+      rev: layer.__dataRev || 0,
+      minimal: true,
+    };
+    if (this.windowIsCurrent(grid, sig)) return;
 
     grid.innerHTML = '';
     const spacer = document.createElement('div');
@@ -2380,6 +2603,7 @@ class MetronomeApp {
 
     layer.__virtual = layer.__virtual || {};
     layer.__virtual.cells = { start: 0, end: 0 };
+    this.markWindowCurrent(grid, sig);
   }
 
   // Refresh only the cheap derived bits of a card (summary + badge), leaving
@@ -2746,18 +2970,23 @@ class MetronomeApp {
     const grid = card.querySelector('.subdivision-grid');
     if (!grid) return;
 
+    // The beat types derived from the grouping changed, but the rendered cell
+    // range may not. Repaint in place and invalidate the cell window's
+    // signature so a later refresh cannot resurrect the old paint.
+    this.bumpLayerDataRevision(layer);
+    grid.__windowSig = null;
+
     const starts = this.groupStartSet(layer);
     const cells = grid.querySelectorAll('.subdiv-cell');
     for (const cell of cells) {
       const index = parseInt(cell.dataset.index, 10);
       if (!Number.isInteger(index) || index < 0 || index >= layer.numerator) continue;
 
-      const type = this.state.getBeatType(layer, index);
-      const wasPlayhead = cell.classList.contains('active-playhead');
-      cell.className = `subdiv-cell ${type}${wasPlayhead ? ' active-playhead' : ''}`;
-      const icon = cell.querySelector('.cell-icon');
-      if (icon) icon.textContent = type === 'accent' ? '●' : (type === 'mute' ? '×' : '○');
-      cell.title = `第 ${index + 1} 拍：${type}`;
+      // One shared painter keeps class, icon, title and the ARIA attributes in
+      // step. Maintaining a second copy of this logic here is how aria-label
+      // and aria-pressed used to go stale after a grouping edit.
+      this.paintCell(cell, index, this.state.getBeatType(layer, index));
+
       const wrapEl = cell.parentElement;
       if (wrapEl && wrapEl.classList) {
         wrapEl.classList.toggle('group-start', starts.has(index) && index > 0);

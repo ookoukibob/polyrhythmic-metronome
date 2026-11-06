@@ -406,6 +406,9 @@ test('cells: remounting shows the current pattern for mounted cells', () => {
   app.setLayerExpanded(layer.id, true);
 
   layer.overrides[0] = 'mute';
+  // Editing state directly bypasses the UI, so announce the change the way a
+  // real edit would; otherwise an identical window is (correctly) not rebuilt.
+  app.bumpLayerDataRevision(layer);
   app.refreshLayerVirtualWindows(layer.id);
 
   const cell = app.dom.layersList.querySelector('.subdiv-cell');

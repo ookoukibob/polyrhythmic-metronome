@@ -724,9 +724,17 @@ button, .subdiv-cell, .tap-btn, .step-btn {
   gap: 2px;
 }
 
+/* Every tag occupies the same width, whether or not it carries both move
+   buttons. The first tag has no left-move target and the last has no
+   right-move target, so those buttons are rendered but disabled — that keeps
+   the flex layout uniform, which is what the virtual row model relies on. */
 .group-tag {
   display: inline-flex;
   align-items: center;
+  justify-content: flex-start;
+  box-sizing: border-box;
+  width: 106px;
+  flex: 0 0 106px;
   background: var(--bg-card);
   border: 1px solid var(--border-subtle);
   border-radius: 6px;
@@ -880,7 +888,11 @@ button, .subdiv-cell, .tap-btn, .step-btn {
    The divider is a pure decoration: it must NOT change layout width, otherwise
    the virtualised grid's spacer arithmetic (index * fixed pitch) would drift
    from the real layout. The marker therefore lives inside the wrap's own box
-   via ::before and the wrap keeps a fixed pitch like every other cell. */
+   and the wrap keeps a fixed pitch like every other cell.
+
+   The cell is opaque and covers the wrap, so the marker is painted above it:
+   a raised z-index on the pseudo-element, and a 1px inset that sits inside the
+   cell's 1px border so it is not clipped by the wrapper's rounding. */
 .subdiv-cell-wrap.group-start {
   position: relative;
 }
@@ -888,13 +900,19 @@ button, .subdiv-cell, .tap-btn, .step-btn {
 .subdiv-cell-wrap.group-start::before {
   content: "";
   position: absolute;
-  left: 1px;
-  top: 0;
-  bottom: 0;
-  width: 2px;
-  background: var(--border-active);
-  border-radius: 1px;
+  left: 0;
+  top: 2px;
+  bottom: 2px;
+  width: 3px;
+  background: var(--accent-cyan);
+  border-radius: 2px;
   pointer-events: none;
+  z-index: 2;
+}
+
+/* Clear the marker from the cell's own left edge so the two do not fight. */
+.subdiv-cell-wrap.group-start .subdiv-cell {
+  padding-left: 4px;
 }
 
 .subdiv-cell {

@@ -18,20 +18,37 @@ const APP_PATH = path.resolve(__dirname, '..', '..', 'app.js');
 // Minimal DOM
 // ---------------------------------------------------------------------------
 
-function createClassList() {
-  const set = new Set();
+// The class list is derived from `className`, not kept in a parallel set:
+// app.js assigns className in several places, and a divergent set made
+// classList.contains() disagree with the class attribute.
+function createClassList(getClassName, setClassName) {
+  const tokens = () => String(getClassName() || '').split(/\s+/).filter(Boolean);
+  const write = (list) => setClassName(list.join(' '));
+
   return {
-    add: (...names) => names.forEach((n) => set.add(n)),
-    remove: (...names) => names.forEach((n) => set.delete(n)),
+    add: (...names) => {
+      const list = tokens();
+      for (const n of names) if (!list.includes(n)) list.push(n);
+      write(list);
+    },
+    remove: (...names) => {
+      write(tokens().filter((t) => !names.includes(t)));
+    },
     toggle: (name, force) => {
-      const on = force === undefined ? !set.has(name) : !!force;
-      if (on) set.add(name);
-      else set.delete(name);
+      const list = tokens();
+      const has = list.includes(name);
+      const on = force === undefined ? !has : !!force;
+      if (on === has) return on;
+      if (on) write([...list, name]);
+      else write(list.filter((t) => t !== name));
       return on;
     },
-    contains: (name) => set.has(name),
+    contains: (name) => tokens().includes(name),
     get size() {
-      return set.size;
+      return tokens().length;
+    },
+    get value() {
+      return tokens().join(' ');
     },
   };
 }
@@ -40,16 +57,22 @@ function createElement(tag = 'div') {
   const el = {
     tagName: String(tag).toUpperCase(),
     id: '',
-    className: '',
+    _className: '',
+    get className() {
+      return el._className;
+    },
+    set className(value) {
+      el._className = String(value === undefined || value === null ? '' : value);
+    },
     _innerHTML: '',
     textContent: '',
     value: '',
     title: '',
+    disabled: false,
     style: {},
     dataset: {},
     children: [],
     parentNode: null,
-    classList: createClassList(),
     listeners: {},
     scrollLeft: 0,
     get innerHTML() {
@@ -67,6 +90,9 @@ function createElement(tag = 'div') {
       (el.listeners[type] = el.listeners[type] || []).push(handler);
     },
     removeEventListener() {},
+    get classList() {
+      return createClassList(() => el._className, (v) => { el._className = v; });
+    },
     dispatch(type, event = {}) {
       (el.listeners[type] || []).forEach((handler) => handler({ target: el, ...event }));
     },
@@ -161,7 +187,15 @@ function createElement(tag = 'div') {
       if (el.__attrs) delete el.__attrs[name];
     },
     getBoundingClientRect: () => ({ left: 0, right: 0, top: 0, bottom: 0, width: 0, height: 0 }),
-    focus() {},
+    focus() {
+      // Track a real active element so focus-preservation can be asserted.
+      const doc = el.ownerDocument;
+      if (doc) doc.activeElement = el;
+    },
+    blur() {
+      const doc = el.ownerDocument;
+      if (doc && doc.activeElement === el) doc.activeElement = doc.body;
+    },
   };
   return el;
 }
@@ -205,8 +239,8 @@ function applyAttrs(el, attrs) {
     else if (name === 'title') el.title = value;
     else if (name === 'style') el.style = value;
     else if (name === 'tabindex') el.tabIndex = Number(value);
-    else if (name.startsWith('data-')) {
-      const key = name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+    else if (name === 'disabled') el.disabled = true;
+    else if (name.startsWith('data-')) {      const key = name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
       el.dataset[key] = value;
     } else {
       el[name] = value;
@@ -236,6 +270,9 @@ function parseMarkupInto(parent, html) {
     }
 
     const el = createElement(tagName);
+    // Inherit the document so focus()/activeElement tracking works on parsed
+    // nodes exactly as it does on nodes created through document.createElement.
+    el.ownerDocument = parent.ownerDocument || null;
     applyAttrs(el, parseAttrs(attrText || ''));
     stack[stack.length - 1].appendChild(el);
 
@@ -320,6 +357,7 @@ function createDocument() {
   const document = {
     elements: byId,
     root,
+    activeElement: null,
     getElementById(id) {
       // Search the live tree only. Unlike a browser, this does NOT synthesise
       // a node for an unknown id — tests need `null` to mean "not in the DOM".
@@ -327,11 +365,22 @@ function createDocument() {
     },
     querySelector: (selector) => queryAll(root, selector)[0] || null,
     querySelectorAll: (selector) => queryAll(root, selector),
-    createElement: (tag) => createElement(tag),
-    createDocumentFragment: () => createFragment(),
+    createElement: (tag) => {
+      const el = createElement(tag);
+      el.ownerDocument = document;
+      return el;
+    },
+    createDocumentFragment: () => {
+      const frag = createFragment();
+      frag.ownerDocument = document;
+      return frag;
+    },
     addEventListener() {},
-    body: createElement('body'),
+    body: null,
   };
+  document.body = document.createElement('body');
+  document.root.appendChild(document.body);
+  document.activeElement = document.body;
   return document;
 }
 
@@ -448,9 +497,22 @@ function createAudioContextStub() {
  * Load app.js into an isolated context.
  * Returns the app's classes plus the stubs the tests need to drive them.
  */
-function loadApp() {
+function loadApp(options = {}) {
   const document = createDocument();
   const audioContext = createAudioContextStub();
+
+  // Optional ResizeObserver stub. Tests can drive the callback with real
+  // entries to verify invalidation without a layout engine.
+  let observerCallback = null;
+  const observed = [];
+  if (options.resizeObserver) {
+    const Stub = class {
+      constructor(cb) { observerCallback = cb; }
+      observe(el) { observed.push(el); }
+      disconnect() { observed.length = 0; }
+    };
+    options.resizeObserver.stub = Stub;
+  }
 
   const intervals = new Map();
   let nextIntervalId = 1;
@@ -483,6 +545,7 @@ function loadApp() {
     console,
     document,
     window: windowObject,
+    ResizeObserver: options.resizeObserver ? options.resizeObserver.stub : undefined,
     navigator: {
       clipboard,
       wakeLock: undefined,
@@ -554,6 +617,14 @@ function loadApp() {
     // Real clipboard object the app calls into, plus a convenience alias.
     clipboard,
     sandboxNavigator: sandbox.navigator,
+
+    // ResizeObserver inspection (when a stub was injected).
+    get observerCallback() { return observerCallback; },
+    get observedTargets() { return [...observed]; },
+    fireResize(entries) {
+      if (!observerCallback) throw new Error('no ResizeObserver callback installed');
+      observerCallback(entries);
+    },
 
     // Timer inspection
     getActiveIntervals: () => intervals.size,
