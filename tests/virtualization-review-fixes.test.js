@@ -349,7 +349,12 @@ test('geometry: fallback geometry is replaced by a real measurement once nodes e
   host.clientWidth = 500;
   const fallback = a.getGroupGeometry(host, layer);
   assert.equal(fallback.measured, false, 'empty DOM yields a fallback');
-  assert.equal(fallback.itemWidth, loadApp().api.VIRTUAL_POLICY.fallbackTagWidth);
+  // The fallback pitch is explicitly tagWidth + gap, from the single source of
+  // truth in VIRTUAL_POLICY — no invented measurement.
+  const policy = loadApp().api.VIRTUAL_POLICY;
+  assert.equal(fallback.tagWidth, policy.groupTagWidth);
+  assert.equal(fallback.gap, policy.groupTagGap);
+  assert.equal(fallback.itemWidth, policy.groupTagWidth + policy.groupTagGap);
 
   // Now mount real tags and give them real geometry, as the browser's layout
   // would. The next call must actually measure them, not return the cached

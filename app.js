@@ -76,6 +76,12 @@ const VIRTUAL_POLICY = Object.freeze({
   fallbackTagHeight: 30,  // .group-tag height incl. row gap
   fallbackCellWidth: 34,  // .subdiv-cell-wrap incl. gap
   fallbackCellHeight: 60, // .subdiv-cell-wrap full height
+  // Flexbox packing rule for .groups-tags-mounted. The LAST tag in a row has
+  // no trailing gap, so `floor(availWidth / itemWidth)` underestimates
+  // capacity by one at exact boundaries. These are the ONLY place the CSS
+  // constants are declared; getGroupGeometry() derives everything from them.
+  groupTagGap: 8,
+  groupTagWidth: 106,
   // Deceleration window for scroll events: one rAF batch per frame.
   scrollSettleMs: 16,
 });
@@ -1348,6 +1354,23 @@ class MetronomeApp {
     const layer = this.state.layers.find((l) => l.id === layerEl.id);
     if (!layer) return;
 
+    // FAST PATH: the beat is already mounted AND inside the visible band.
+    // highlightBeat() paints the class in place, so no scroll, no pending
+    // request and no rebuild is needed. This is what keeps playback inside one
+    // range free of DOM churn even when page-scroll refreshes land per frame.
+    // A beat that is mounted only in the overscan margin still falls through
+    // so auto-follow keeps the playhead visibly centred.
+    const mounted = layer.__virtual && layer.__virtual.cells;
+    const viewLeftNow = wrap.scrollLeft || 0;
+    const viewWidthNow = wrap.clientWidth || 0;
+    const pitchNow = this.getCellGeometry(grid).itemWidth;
+    if (mounted && subdivIndex >= mounted.start && subdivIndex < mounted.end &&
+        pitchNow > 0 && viewWidthNow > 0) {
+      const left = subdivIndex * pitchNow;
+      const right = left + pitchNow;
+      if (left >= viewLeftNow && right <= viewLeftNow + viewWidthNow) return;
+    }
+
     const geom = this.getCellGeometry(grid);
     const pitch = geom.itemWidth;
     if (!(pitch > 0)) return;
@@ -1795,9 +1818,9 @@ class MetronomeApp {
     if (prev.geom !== sig.geom) return false;
     if (prev.rev !== sig.rev) return false;
     if (prev.minimal !== sig.minimal) return false;
-    // Cell windows additionally depend on the playhead, the roving cursor and
-    // any pending focus/follow request.
-    if (prev.playhead !== sig.playhead) return false;
+    // Cell windows additionally depend on the roving cursor and any pending
+    // focus/follow request — but NOT on the playhead beat index, which is
+    // dynamic presentation state painted in place by highlightBeat().
     if (prev.cursor !== sig.cursor) return false;
     if (prev.pending !== sig.pending) return false;
     return true;
@@ -1954,9 +1977,21 @@ class MetronomeApp {
     let start = win.start;
     let end = win.end;
     const pending = this.pendingCellIndex && this.pendingCellIndex.get(layer.id);
+    if (Number.isInteger(pending) && pending >= 0 && pending < total &&
+        (pending < start || pending >= end)) {
+      // The target is outside the window: build a bounded window AROUND it
+      // instead of stretching the old one (which could mount 0..pending and
+      // destroy the whole point of virtualisation on a long jump).
+      const half = Math.max(VIRTUAL_POLICY.minWindowItems, 2 * VIRTUAL_POLICY.overscanItems + 1);
+      start = Math.max(0, pending - half);
+      end = Math.min(total, pending + half);
+      // Keep the window at least the minimum size.
+      if (end - start < VIRTUAL_POLICY.minWindowItems) {
+        end = Math.min(total, start + VIRTUAL_POLICY.minWindowItems);
+        start = Math.max(0, end - VIRTUAL_POLICY.minWindowItems);
+      }
+    }
     if (Number.isInteger(pending) && pending >= 0 && pending < total) {
-      if (pending < start) start = Math.max(0, pending - VIRTUAL_POLICY.overscanItems);
-      if (pending >= end) end = Math.min(total, pending + VIRTUAL_POLICY.overscanItems + 1);
       // The window now guarantees the target is mounted; the request is
       // satisfied. Clearing here keeps the steady-state signature stable.
       if (this.pendingCellIndex) this.pendingCellIndex.delete(layer.id);
@@ -1970,7 +2005,12 @@ class MetronomeApp {
       geom: `${Math.round(geom.itemWidth)}|${total}`,
       rev: layer.__dataRev || 0,
       minimal: false,
-      playhead: this.state.isPlaying ? (this.currentPlayhead && this.currentPlayhead.get(layer.id)) : null,
+      // The playhead is deliberately NOT part of the structural signature.
+      // highlightBeat() updates the active-playhead class in place, so a beat
+      // change must not invalidate the window: doing so rebuilt the whole
+      // Pattern DOM on the next page-scroll refresh during playback. Newly
+      // mounted cells still pick up the current playhead through
+      // subdivCellHtml(), which runs whenever a REAL window change occurs.
       cursor: this.gridCursor && this.gridCursor.get(layer.id),
       // A pending request means the caller expects the target beat to be
       // mounted on THIS pass; an otherwise identical signature must not skip it.
@@ -2242,12 +2282,17 @@ class MetronomeApp {
 
     const total = layer ? layer.groups.length : (host.querySelectorAll('.group-tag').length || 1);
 
-    let itemWidth = VIRTUAL_POLICY.fallbackTagWidth;
+    // Single source of truth for the flex layout. tagWidth is the tag's own
+    // width; gap is the space BETWEEN tags. Keeping them separate lets the row
+    // capacity use the real packing rule below.
+    const gap = VIRTUAL_POLICY.groupTagGap;
+    let tagWidth = VIRTUAL_POLICY.groupTagWidth;
     let rowHeight = VIRTUAL_POLICY.fallbackTagHeight;
     let measured = false;
 
-    // Measure up to three tags and take the widest: the button count varies
-    // between the first, middle and last tag.
+    // Measure up to three tags and take the widest. All tags now share a fixed
+    // width, but a real measurement still protects against font/zoom changes
+    // and keeps the fallback path honest.
     const tags = host.querySelectorAll('.group-tag');
     if (tags.length > 0) {
       let maxW = 0;
@@ -2259,17 +2304,27 @@ class MetronomeApp {
         if (r.height > maxH) maxH = r.height;
       }
       if (maxW > 0) {
-        itemWidth = maxW + 8;   // flex column gap
+        tagWidth = maxW;
         measured = true;
       }
-      if (maxH > 0) rowHeight = maxH + 8; // flex row gap
+      if (maxH > 0) rowHeight = maxH + gap;
     }
 
+    // itemWidth remains the pitch used by the spacer/geometry consumers:
+    // one tag plus the gap that separates it from the next tag.
+    const itemWidth = tagWidth + gap;
     const availWidth = host.clientWidth || (this.viewportWidth() - 80);
-    const itemsPerRow = Math.max(1, Math.floor(availWidth / itemWidth));
+
+    // Flexbox fits N tags when N*tagWidth + (N-1)*gap <= availWidth, i.e.
+    // N*(tagWidth+gap) <= availWidth + gap. Adding the gap back is what makes
+    // 334px fit three 106px tags with 8px gaps (3*106 + 2*8 = 334).
+    const itemsPerRow = Math.max(1,
+      Math.floor((availWidth + gap) / (tagWidth + gap)));
 
     const geom = {
       itemWidth,
+      tagWidth,
+      gap,
       rowHeight,
       itemsPerRow,
       totalRows: Math.max(1, Math.ceil(total / itemsPerRow)),
@@ -2464,11 +2519,49 @@ class MetronomeApp {
     return null;
   }
 
+  // Focus a replacement element without letting the browser scroll an ancestor
+  // into view. Virtual-window recycling must not move the page or the pattern
+  // scroller; only explicit navigation (focusCell) and playback follow scroll.
+  focusReplacement(el) {
+    if (!el || typeof el.focus !== 'function') return;
+    try {
+      el.focus({ preventScroll: true });
+      return;
+    } catch (e) {
+      // Some engines ignore or reject the options object. Save the scroll
+      // positions that a default focus would disturb and put them back.
+    }
+    const doc = (typeof document !== 'undefined') ? document : null;
+    const win = (typeof window !== 'undefined') ? window : null;
+    const pageX = win ? win.scrollX : 0;
+    const pageY = win ? win.scrollY : 0;
+    const scroller = (function findScroller(node) {
+      let n = node && node.parentNode;
+      while (n) {
+        if (typeof n.scrollLeft === 'number' && n.classList &&
+            n.classList.contains('subdivision-scroll-wrap')) return n;
+        n = n.parentNode;
+      }
+      return null;
+    })(el);
+    const scrollerLeft = scroller ? scroller.scrollLeft : 0;
+
+    try { el.focus(); } catch (e2) { /* not focusable */ }
+
+    if (scroller && scroller.scrollLeft !== scrollerLeft) scroller.scrollLeft = scrollerLeft;
+    if (win) {
+      if (win.scrollX !== pageX || win.scrollY !== pageY) {
+        try { win.scrollTo(pageX, pageY); } catch (e3) { /* ignore */ }
+      }
+    }
+    void doc;
+  }
+
   restoreVirtualFocus(layer, card, focus) {
     if (focus.kind === 'cell') {
       const cell = card.querySelector(`.subdiv-cell[data-index="${focus.index}"]`);
-      if (!cell || typeof cell.focus !== 'function') return;
-      cell.focus();
+      if (!cell) return;
+      this.focusReplacement(cell);
       this.setGridCursor(layer, focus.index);
       return;
     }
@@ -2478,11 +2571,22 @@ class MetronomeApp {
       if (!tag) return;
       const input = tag.querySelector('.group-tag-val');
       if (!input) return;
-      // The value lives in state; only restore the caret the user had.
-      input.focus();
+
+      // The DOM value can legitimately differ from state while the user is
+      // still editing (the change event has not fired yet state still holds
+      // 4 while the input shows 7). Put the UNCOMMITTED value back; the
+      // delegated change handler will validate and commit it normally later.
+      if (focus.value !== undefined && focus.value !== null) {
+        input.value = focus.value;
+      }
+      this.focusReplacement(input);
+
+      // type="number" does not support selection APIs in Chromium; only try
+      // when the browser actually exposes them, and never claim more than that.
       if (focus.selStart !== null && typeof input.setSelectionRange === 'function') {
         try {
-          input.setSelectionRange(focus.selStart, focus.selEnd === null ? focus.selStart : focus.selEnd);
+          input.setSelectionRange(focus.selStart,
+            focus.selEnd === null ? focus.selStart : focus.selEnd);
         } catch (e) {
           // Number inputs reject setSelectionRange in some engines.
         }
@@ -2496,8 +2600,49 @@ class MetronomeApp {
       const cls = focus.button === 'left' ? '.group-move-left'
         : focus.button === 'right' ? '.group-move-right' : '.group-tag-del';
       const btn = tag.querySelector(cls);
-      if (btn && typeof btn.focus === 'function' && !btn.disabled) btn.focus();
+      if (btn && !btn.disabled) this.focusReplacement(btn);
     }
+  }
+
+  // Move keyboard focus to a specific group's action button after a detail
+  // rebuild. Falls back to the Add Group button when the target index is no
+  // longer mounted (virtual window moved) or the button is disabled.
+  focusGroupAction(layer, gIdx, buttonName) {
+    const card = document.getElementById(layer.id);
+    if (!card) return;
+    const tag = this.findMountedTag(card, gIdx);
+    if (tag) {
+      const cls = buttonName === 'left' ? '.group-move-left'
+        : buttonName === 'right' ? '.group-move-right' : '.group-tag-del';
+      const btn = tag.querySelector(cls);
+      if (btn && !btn.disabled) {
+        this.focusReplacement(btn);
+        return;
+      }
+      // A boundary move button can be disabled after the swap; keep focus on
+      // an enabled button of the same group instead of dropping it.
+      const fallback = tag.querySelector('.group-tag-del') || tag.querySelector('.group-move-left');
+      if (fallback && !fallback.disabled) {
+        this.focusReplacement(fallback);
+        return;
+      }
+    }
+    const addBtn = card.querySelector('.add-group-btn');
+    if (addBtn) this.focusReplacement(addBtn);
+  }
+
+  // After deleting a group, focus a surviving neighbour's action button — or
+  // the Add Group button when that was the last group.
+  focusAfterGroupDelete(layer, removedIdx) {
+    const card = document.getElementById(layer.id);
+    if (!card) return;
+    if (layer.groups.length === 0) {
+      const addBtn = card.querySelector('.add-group-btn');
+      if (addBtn) this.focusReplacement(addBtn);
+      return;
+    }
+    const target = Math.min(removedIdx, layer.groups.length - 1);
+    this.focusGroupAction(layer, target, 'del');
   }
 
   findMountedTag(card, gIdx) {
@@ -2880,10 +3025,18 @@ class MetronomeApp {
         const tag = btn.closest('.group-tag');
         const gIdx = tag ? parseInt(tag.dataset.gidx, 10) : -1;
 
+        // These handlers rebuild the entire detail DOM, so capture a logical
+        // focus destination BEFORE the rebuild. Only act when the focused
+        // element really was the group button the user activated; an unrelated
+        // control must keep its focus.
+        const doc = (typeof document !== 'undefined') ? document : null;
+        const activatedByFocus = doc && doc.activeElement === btn;
+
         if (btn.classList.contains('group-tag-del')) {
           if (!Number.isInteger(gIdx)) return;
           layer.groups.splice(gIdx, 1);
           this.refreshLayerDetail(layer);
+          if (activatedByFocus) this.focusAfterGroupDelete(layer, gIdx);
           return;
         }
 
@@ -2893,6 +3046,7 @@ class MetronomeApp {
           layer.groups[gIdx] = layer.groups[gIdx - 1];
           layer.groups[gIdx - 1] = temp;
           this.refreshLayerDetail(layer);
+          if (activatedByFocus) this.focusGroupAction(layer, gIdx - 1, 'left');
           return;
         }
 
@@ -2902,6 +3056,7 @@ class MetronomeApp {
           layer.groups[gIdx] = layer.groups[gIdx + 1];
           layer.groups[gIdx + 1] = temp;
           this.refreshLayerDetail(layer);
+          if (activatedByFocus) this.focusGroupAction(layer, gIdx + 1, 'right');
         }
       });
     }
