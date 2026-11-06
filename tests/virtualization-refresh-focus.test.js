@@ -485,3 +485,205 @@ test('focus: keyboard navigation still works after a focus-preserving refresh', 
   assert.equal(app.gridCursor.get(layer.id), parseInt(current.dataset.index, 10) + 1);
 });
 
+// ===========================================================================
+// Off-screen draft preservation (Test A - E)
+// ===========================================================================
+
+// Helper: a small, fully-mounted layer with one group whose committed value
+// is 4. Small lists use the `groups-full` window, which is exactly what an
+// off-screen collapse + re-mount exercises.
+function draftApp() {
+  const { app } = loadOne(LIMITS, { groups: [4, 4, 4] });
+  const layer = app.state.layers[0];
+  app.setLayerExpanded(layer.id, true);
+  return { app, layer };
+}
+
+const firstInput = (app, layerId) =>
+  tagNodes(app, layerId)[0].querySelector('.group-tag-val');
+
+// Simulate the real page-scroll collapse path, then a fresh mount.
+function collapseAndRemount(app, layer) {
+  app.collapseVirtualWindow(layer.id);
+  // The layer is expanded again by the normal mount path; reset the minimal
+  // flags exactly as a scroll back into view would through mountGroupWindow.
+  const card = app.document.getElementById(layer.id);
+  app.mountGroupWindow(layer, card);
+}
+
+test('draft A: an uncommitted value survives off-screen collapse and re-mount', () => {
+  const { app, layer } = draftApp();
+
+  const input = firstInput(app, layer.id);
+  assert.equal(String(layer.groups[0]), '4');
+  input.value = '7';
+  input.dispatchEvent({ type: 'input' });   // NO change event
+
+  collapseAndRemount(app, layer);
+
+  const again = firstInput(app, layer.id);
+  assert.equal(again.value, '7', 'draft restored on the replacement input');
+  assert.equal(String(layer.groups[0]), '4', 'committed state untouched');
+  assert.equal(app.getGroupDraft(layer.id, 0), '7', 'draft still uncommitted');
+});
+
+test('draft B: restoring a draft does not steal focus', () => {
+  const { app, layer } = draftApp();
+
+  const input = firstInput(app, layer.id);
+  input.value = '7';
+  input.focus();
+  input.dispatchEvent({ type: 'input' });
+
+  collapseAndRemount(app, layer);
+
+  // User moved focus elsewhere while the layer was off-screen.
+  const other = app.document.createElement('button');
+  app.document.body.appendChild(other);
+  other.focus();
+
+  // A further refresh must keep focus on the unrelated control.
+  app.mountGroupWindow(layer, app.document.getElementById(layer.id));
+  assert.equal(firstInput(app, layer.id).value, '7', 'draft still restored');
+  assert.equal(app.document.activeElement, other, 'focus not stolen');
+});
+
+test('draft C: a restored draft commits normally and is then cleared', () => {
+  const { app, layer } = draftApp();
+
+  firstInput(app, layer.id).value = '7';
+  firstInput(app, layer.id).dispatchEvent({ type: 'input' });
+  collapseAndRemount(app, layer);
+
+  const again = firstInput(app, layer.id);
+  assert.equal(again.value, '7');
+  // Normal commit through the delegated change handler.
+  again.dispatchEvent({ type: 'change' });
+
+  assert.equal(String(layer.groups[0]), '7', 'state committed');
+  assert.equal(app.getGroupDraft(layer.id, 0), undefined, 'draft cleared');
+
+  // Another collapse/re-mount must show the committed value, not a stale draft.
+  collapseAndRemount(app, layer);
+  assert.equal(firstInput(app, layer.id).value, '7');
+  assert.equal(app.getGroupDraft(layer.id, 0), undefined);
+});
+
+test('draft D: a move keeps the draft with its own group, not its index', () => {
+  const { app, layer } = draftApp();
+
+  const input = tagNodes(app, layer.id)[1].querySelector('.group-tag-val');
+  input.value = '9';
+  input.dispatchEvent({ type: 'input' });
+  assert.equal(app.getGroupDraft(layer.id, 1), '9');
+
+  // Move group 1 left by clicking its left button.
+  const tag = tagNodes(app, layer.id)[1];
+  tag.querySelector('.group-move-left').dispatchEvent({ type: 'click' });
+
+  assert.equal(app.getGroupDraft(layer.id, 0), '9', 'draft followed the group to index 0');
+  assert.equal(app.getGroupDraft(layer.id, 1), undefined, 'no draft left on the shifted group');
+  const movedInput = tagNodes(app, layer.id)[0].querySelector('.group-tag-val');
+  assert.equal(movedInput.value, '9');
+});
+
+test('draft D: deleting a group clears its draft', () => {
+  const { app, layer } = draftApp();
+
+  const input = tagNodes(app, layer.id)[1].querySelector('.group-tag-val');
+  input.value = '9';
+  input.dispatchEvent({ type: 'input' });
+  assert.equal(app.getGroupDraft(layer.id, 1), '9');
+
+  tagNodes(app, layer.id)[1].querySelector('.group-tag-del').dispatchEvent({ type: 'click' });
+
+  assert.equal(layer.groups.length, 2);
+  assert.equal(app.draftsFor(layer.id).size, 0, 'deleted group draft removed');
+});
+
+test('draft D: inserting a group does not reassign an existing draft', () => {
+  const { app, layer } = draftApp();
+
+  const input = tagNodes(app, layer.id)[0].querySelector('.group-tag-val');
+  input.value = '9';
+  input.dispatchEvent({ type: 'input' });
+
+  const card = app.document.getElementById(layer.id);
+  card.querySelector('.add-group-btn').dispatchEvent({ type: 'click' });
+
+  assert.equal(layer.groups.length, 4);
+  assert.equal(app.getGroupDraft(layer.id, 0), '9', 'draft still on the original group');
+  assert.equal(app.getGroupDraft(layer.id, 3), undefined, 'new group has no draft');
+});
+
+test('draft D: loading a new configuration clears stale drafts', () => {
+  const { app, layer } = draftApp();
+  firstInput(app, layer.id).value = '7';
+  firstInput(app, layer.id).dispatchEvent({ type: 'input' });
+  assert.equal(app.getGroupDraft(layer.id, 0), '7');
+
+  app.loadPresetData({ name: 'new', bpm: 120, layers: [{
+    name: 'N', numerator: 8, denominator: 8, bpmMultiplier: 1,
+    groups: [2, 2, 2, 2], overrides: {}, sound: 'classic',
+    volume: 0.8, accentVolume: 1.3, muted: false,
+  }] });
+
+  assert.equal(app.groupDrafts.size, 0, 'all drafts cleared on config replacement');
+});
+
+test('draft D: removing a layer clears its drafts', () => {
+  const { app, layer } = draftApp();
+  // Add a second layer so removal is allowed.
+  app.addLayer({ name: 'Other', numerator: 4, denominator: 4, groups: [2, 2] });
+  firstInput(app, layer.id).value = '7';
+  firstInput(app, layer.id).dispatchEvent({ type: 'input' });
+
+  app.removeLayer(layer.id);
+  assert.equal(app.groupDrafts.has(layer.id), false);
+});
+
+test('draft E: an unchanged refresh does not touch a mounted input', () => {
+  const { app, layer } = draftApp();
+  const input = firstInput(app, layer.id);
+  input.focus();
+  input.value = '7';
+  input.dispatchEvent({ type: 'input' });
+
+  // Instrument the LIVE node: a no-op refresh must not re-assign value or
+  // call focus() on it (that would disturb the caret / IME composition).
+  let valueWrites = 0;
+  let focusCalls = 0;
+  let stored = '7';
+  Object.defineProperty(input, 'value', {
+    get() { return stored; },
+    set(v) { valueWrites++; stored = String(v); },
+    configurable: true,
+  });
+  const originalFocus = input.focus;
+  input.focus = () => { focusCalls++; return originalFocus.call(input); };
+
+  app.refreshLayerVirtualWindows(layer.id, 'groups');  // identical signature
+
+  assert.equal(app.document.activeElement, input, 'focus stays on the same node');
+  assert.equal(valueWrites, 0, 'no value re-assignment on an unchanged window');
+  assert.equal(focusCalls, 0, 'no focus() call on an unchanged window');
+  assert.equal(input.value, '7', 'the in-progress edit is intact');
+});
+
+test('draft E: a real window change still restores focus', () => {
+  const { app, layer } = draftApp();
+  const input = firstInput(app, layer.id);
+  input.focus();
+  input.value = '7';
+  input.dispatchEvent({ type: 'input' });
+
+  const host = app.document.getElementById(layer.id).querySelector('.groups-tags-list');
+  host.__windowSig = null;                 // force a genuine rebuild
+  app.refreshLayerVirtualWindows(layer.id, 'groups');
+
+  const again = firstInput(app, layer.id);
+  assert.notEqual(again, input, 'the node really was replaced');
+  assert.equal(app.document.activeElement, again, 'focus restored after a real rebuild');
+  assert.equal(again.value, '7');
+});
+

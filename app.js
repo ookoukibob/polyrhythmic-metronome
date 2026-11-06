@@ -788,7 +788,7 @@ class MetronomeState {
     const name = normalizeName(config.name, `Layer ${this.layers.length + 1}`);
     const sound = METRONOME_SOUNDS.includes(config.sound) ? config.sound : 'classic';
 
-    return {
+    const layer = {
       id,
       name,
       numerator,
@@ -806,6 +806,25 @@ class MetronomeState {
       currentSubdiv: 0,
       color: typeof config.color === 'string' && config.color ? config.color : this.getLayerColor(this.layers.length),
     };
+
+    // Parallel stable IDs for grouping entries. These are RUNTIME-ONLY: they
+    // are defined non-enumerable so JSON.stringify (share links, saved
+    // presets, localStorage) never sees them, and no config format changes.
+    // Drafts key off these IDs, so inserting / deleting / moving a group can
+    // never apply an uncommitted edit to a different group.
+    Object.defineProperty(layer, '__groupIds', {
+      value: groups.map(() => this.nextGroupId()),
+      writable: true, enumerable: false, configurable: true,
+    });
+    Object.defineProperty(layer, '__groupSeq', {
+      value: groups.length, writable: true, enumerable: false, configurable: true,
+    });
+    return layer;
+  }
+
+  nextGroupId() {
+    this.__groupIdCounter = (this.__groupIdCounter || 0) + 1;
+    return 'g' + this.__groupIdCounter;
   }
 
   getLayerColor(index) {
@@ -1031,6 +1050,11 @@ class MetronomeApp {
     this.pendingCellIndex = new Map();
     this.gridCursor = new Map();
 
+    // Uncommitted Group input drafts, kept OUTSIDE the DOM so off-screen
+    // virtualisation can discard the nodes without losing what the user typed.
+    // Structure: Map<layerId, Map<stableGroupId, rawString>>.
+    this.groupDrafts = new Map();
+
     // Check URL state first, otherwise load default
     if (!this.loadStateFromUrl()) {
       // Default directly to 59/16 signature metronome
@@ -1234,6 +1258,7 @@ class MetronomeApp {
     this.expandedLayerIds.delete(layerId);
     this.detachLayerVirtualObserver(layerId);
     if (this.currentPlayhead) this.currentPlayhead.delete(layerId);
+    this.clearLayerDrafts(layerId);
     const card = document.getElementById(layerId);
     if (card && card.parentNode) card.parentNode.removeChild(card);
 
@@ -1838,7 +1863,7 @@ class MetronomeApp {
 
   mountGroupWindow(layer, card) {
     const host = card.querySelector('.groups-tags-list');
-    if (!host) return;
+    if (!host) return false;
     // A real (viewport-driven) mount supersedes any minimal mount.
     host.__minimal = false;
 
@@ -1857,7 +1882,9 @@ class MetronomeApp {
         rev: layer.__dataRev || 0,
         minimal: false,
       };
-      if (this.windowIsCurrent(host, sig)) return;
+      // Return false when the DOM was left untouched, so callers skip a
+      // needless focus restore that would disturb an input being edited.
+      if (this.windowIsCurrent(host, sig)) return false;
 
       host.innerHTML = '';
       const all = document.createElement('div');
@@ -1869,7 +1896,7 @@ class MetronomeApp {
       layer.__virtual = layer.__virtual || {};
       layer.__virtual.groups = { start: 0, end: totalGroups };
       this.markWindowCurrent(host, sig);
-      return;
+      return true;
     }
 
     const hostRect = this.rectOf(host);
@@ -1899,7 +1926,7 @@ class MetronomeApp {
       rev: layer.__dataRev || 0,
       minimal: false,
     };
-    if (this.windowIsCurrent(host, sig)) return;
+    if (this.windowIsCurrent(host, sig)) return false;
 
     const parts = [];
     for (let i = start; i < end; i++) {
@@ -1934,13 +1961,14 @@ class MetronomeApp {
     layer.__virtual = layer.__virtual || {};
     layer.__virtual.groups = { start, end };
     this.markWindowCurrent(host, sig);
+    return true;
   }
 
   // --- Pattern cells --------------------------------------------------------
 
   mountCellWindow(layer, card) {
     const grid = card.querySelector('.subdivision-grid');
-    if (!grid) return;
+    if (!grid) return false;
     grid.__minimal = false;
 
     const wrap = card.querySelector('.subdivision-scroll-wrap');
@@ -2018,7 +2046,7 @@ class MetronomeApp {
       // clearing the pending map after the mount does not force a second rebuild.
       pending: (this.pendingCellIndex && this.pendingCellIndex.has(layer.id)) ? 1 : 0,
     };
-    if (this.windowIsCurrent(grid, sig)) return;
+    if (this.windowIsCurrent(grid, sig)) return false;
 
     const parts = [];
     for (let i = start; i < end; i++) {
@@ -2059,6 +2087,7 @@ class MetronomeApp {
     layer.__virtual.cells = { start, end };
     layer.__virtual.starts = starts;
     this.markWindowCurrent(grid, sig);
+    return true;
   }
 
   groupStartSet(layer) {
@@ -2076,7 +2105,12 @@ class MetronomeApp {
   // disabled rather than omitted: omitting it made the first and last tag
   // narrower, so the virtual row model disagreed with the real layout.
   groupTagHtml(layer, gIdx) {
-    const val = layer.groups[gIdx];
+    const committed = layer.groups[gIdx];
+    const draft = this.getGroupDraft(layer.id, gIdx);
+    // An uncommitted draft wins for DISPLAY only. It is never written back to
+    // layer.groups here, and mounting never focuses the input. The draft is a
+    // raw DOM string, so escape it before interpolating into an attribute.
+    const val = this.escapeHtml(String(draft !== undefined ? draft : committed));
     const isFirst = gIdx === 0;
     const isLast = gIdx === layer.groups.length - 1;
     return (
@@ -2456,14 +2490,136 @@ class MetronomeApp {
     if (!card) return;
 
     // Rebinding destroys the nodes that currently hold focus. Capture the
-    // logical identity first, and restore it afterwards if the focused node is
-    // the one being replaced.
+    // logical identity first, and restore it afterwards ONLY for the
+    // collection whose DOM was actually replaced. A no-op refresh (same
+    // signature) must not re-assign value or call focus() on a live input:
+    // that would disturb the caret and any IME composition in progress.
     const focus = this.captureVirtualFocus(card);
 
-    if (target !== 'cells') this.mountGroupWindow(layer, card);
-    if (target !== 'groups') this.mountCellWindow(layer, card);
+    let groupsRebuilt = false;
+    let cellsRebuilt = false;
+    if (target !== 'cells') groupsRebuilt = this.mountGroupWindow(layer, card);
+    if (target !== 'groups') cellsRebuilt = this.mountCellWindow(layer, card);
 
-    if (focus) this.restoreVirtualFocus(layer, card, focus);
+    if (!focus) return;
+    const focusInGroups = focus.kind === 'group-input' || focus.kind === 'group-button';
+    if ((focusInGroups && groupsRebuilt) || (!focusInGroups && cellsRebuilt)) {
+      this.restoreVirtualFocus(layer, card, focus);
+    }
+  }
+
+  // --- Uncommitted Group input drafts ------------------------------------
+  //
+  // A draft is a raw DOM string the user has typed but not committed with a
+  // `change` event. It must survive off-screen virtualisation (which destroys
+  // every Group node) without ever being written into the committed
+  // layer.groups state, and without leaking into presets / share links.
+  // Drafts are keyed by a stable per-group id, not by array index.
+
+  // Keep the parallel __groupIds array aligned with layer.groups after a
+  // structural change that replaced the whole array. Also drops drafts for
+  // ids that no longer belong to this layer.
+  ensureGroupIds(layer) {
+    let ids = layer.__groupIds;
+    if (!Array.isArray(ids)) {
+      ids = [];
+      Object.defineProperty(layer, '__groupIds', {
+        value: ids, writable: true, enumerable: false, configurable: true,
+      });
+      Object.defineProperty(layer, '__groupSeq', {
+        value: 0, writable: true, enumerable: false, configurable: true,
+      });
+    }
+    // Preserve ids for surviving positions; generate fresh ids for new tail
+    // entries. When the array was wholesale replaced, callers use
+    // rebuildGroupIds() instead so no stale draft is reused.
+    while (ids.length < layer.groups.length) ids.push(this.state.nextGroupId());
+    if (ids.length > layer.groups.length) ids.length = layer.groups.length;
+    return ids;
+  }
+
+  // Wholesale replacement of the grouping (auto/even/clear/meter change/preset
+  // load): every group is new, so give them all fresh ids and drop the drafts.
+  rebuildGroupIds(layer) {
+    const ids = layer.groups.map(() => this.state.nextGroupId());
+    Object.defineProperty(layer, '__groupIds', {
+      value: ids, writable: true, enumerable: false, configurable: true,
+    });
+    Object.defineProperty(layer, '__groupSeq', {
+      value: ids.length, writable: true, enumerable: false, configurable: true,
+    });
+    this.clearLayerDrafts(layer.id);
+    return ids;
+  }
+
+  groupIdAt(layer, gIdx) {
+    const ids = this.ensureGroupIds(layer);
+    return ids[gIdx];
+  }
+
+  draftsFor(layerId) {
+    // Lazily initialised: the test harness constructs the app without calling
+    // init(), so every accessor must be safe on a fresh instance.
+    if (!this.groupDrafts) this.groupDrafts = new Map();
+    if (!this.groupDrafts.has(layerId)) this.groupDrafts.set(layerId, new Map());
+    return this.groupDrafts.get(layerId);
+  }
+
+  setGroupDraft(layerId, gIdx, rawValue) {
+    const layer = this.state.layers.find((l) => l.id === layerId);
+    if (!layer || gIdx < 0 || gIdx >= layer.groups.length) return;
+    const id = this.groupIdAt(layer, gIdx);
+    if (!id) return;
+    // An empty string is still a legitimate intermediate draft; keep it.
+    this.draftsFor(layerId).set(id, String(rawValue));
+  }
+
+  getGroupDraft(layerId, gIdx) {
+    // Read-only: never create an empty per-layer map just by asking.
+    if (!this.groupDrafts || !this.groupDrafts.has(layerId)) return undefined;
+    const layer = this.state.layers.find((l) => l.id === layerId);
+    if (!layer || gIdx < 0 || gIdx >= layer.groups.length) return undefined;
+    const id = this.groupIdAt(layer, gIdx);
+    if (!id) return undefined;
+    return this.groupDrafts.get(layerId).get(id);
+  }
+
+  clearGroupDraft(layerId, gIdx) {
+    if (!this.groupDrafts || !this.groupDrafts.has(layerId)) return;
+    const layer = this.state.layers.find((l) => l.id === layerId);
+    if (!layer) return;
+    const id = this.groupIdAt(layer, gIdx);
+    if (id) this.groupDrafts.get(layerId).delete(id);
+  }
+
+  clearLayerDrafts(layerId) {
+    if (this.groupDrafts) this.groupDrafts.delete(layerId);
+  }
+
+  clearAllDrafts() {
+    if (this.groupDrafts) this.groupDrafts.clear();
+  }
+
+  // Before off-screen collapse: copy the CURRENT DOM value of every mounted
+  // Group input into the draft store, regardless of focus or whether `change`
+  // has fired. Committed values match state, so storing them is harmless; the
+  // important case is an input that differs from state.
+  saveMountedGroupDrafts(layer, card) {
+    const inputs = card.querySelectorAll('.group-tag-val');
+    for (const input of inputs) {
+      const tag = input.closest && input.closest('.group-tag');
+      if (!tag) continue;
+      const gIdx = parseInt(tag.dataset.gidx, 10);
+      if (!Number.isInteger(gIdx) || gIdx < 0 || gIdx >= layer.groups.length) continue;
+      // Only persist a value that differs from the committed state. This
+      // avoids creating drafts for untouched inputs and never overwrites one
+      // group's draft with another group's value.
+      if (String(input.value) !== String(layer.groups[gIdx])) {
+        this.setGroupDraft(layer.id, gIdx, input.value);
+      } else {
+        this.clearGroupDraft(layer.id, gIdx);
+      }
+    }
   }
 
   /**
@@ -2683,6 +2839,9 @@ class MetronomeApp {
 
     const tagsHost = card.querySelector('.groups-tags-list');
     if (tagsHost && !(tagsHost.__minimal)) {
+      // BEFORE destroying the Group DOM: persist any uncommitted input value
+      // outside the DOM, so scrolling back can show the same draft.
+      this.saveMountedGroupDrafts(layer, card);
       tagsHost.__minimal = true;
       this.renderMinimalGroupWindow(layer, card);
     }
@@ -2873,6 +3032,7 @@ class MetronomeApp {
         layer.numerator = newNum;
         layer.groups = this.state.autoGroup(newNum);
         layer.overrides = {};
+        this.rebuildGroupIds(layer);
         this.refreshLayerDetail(layer);
       }
     });
@@ -2942,6 +3102,7 @@ class MetronomeApp {
     card.querySelector('.btn-auto-group').addEventListener('click', () => {
       layer.groups = this.state.autoGroup(layer.numerator);
       layer.overrides = {};
+      this.rebuildGroupIds(layer);
       this.refreshLayerDetail(layer);
     });
 
@@ -2956,6 +3117,7 @@ class MetronomeApp {
         clampGroupValue(base + (i < rem ? 1 : 0))
       );
       layer.overrides = {};
+      this.rebuildGroupIds(layer);
       this.refreshLayerDetail(layer);
     });
 
@@ -2976,6 +3138,7 @@ class MetronomeApp {
     // Clear Grouping
     card.querySelector('.btn-clear-group').addEventListener('click', () => {
       layer.groups = [];
+      this.rebuildGroupIds(layer);
       this.refreshLayerDetail(layer);
     });
 
@@ -2991,6 +3154,9 @@ class MetronomeApp {
       const currentSum = layer.groups.reduce((a, b) => a + b, 0);
       const remaining = Math.max(1, layer.numerator - currentSum);
       layer.groups.push(clampGroupValue(remaining > 0 ? remaining : 2));
+      // ensureGroupIds() generates a fresh stable id for the new tail entry;
+      // existing drafts keep their ids and are untouched.
+      this.ensureGroupIds(layer);
       this.refreshLayerDetail(layer);
     });
 
@@ -3000,6 +3166,19 @@ class MetronomeApp {
     const tagsContainer = card.querySelector('.groups-tags-container');
     if (tagsContainer && !tagsContainer.dataset.bound) {
       tagsContainer.dataset.bound = '1';
+
+      // Every keystroke updates the runtime draft only. The committed
+      // layer.groups value stays untouched until `change` fires, so a page
+      // scroll that collapses this layer cannot lose what is being typed.
+      tagsContainer.addEventListener('input', (e) => {
+        const input = e.target.closest('.group-tag-val');
+        if (!input) return;
+        const tag = input.closest('.group-tag');
+        if (!tag) return;
+        const gIdx = parseInt(tag.dataset.gidx, 10);
+        if (!Number.isInteger(gIdx)) return;
+        this.setGroupDraft(layer.id, gIdx, input.value);
+      });
 
       tagsContainer.addEventListener('change', (e) => {
         const input = e.target.closest('.group-tag-val');
@@ -3012,6 +3191,8 @@ class MetronomeApp {
         const val = clampGroupValue(input.value);
         layer.groups[gIdx] = val;
         input.value = val;
+        // Committed: the draft is no longer needed.
+        this.clearGroupDraft(layer.id, gIdx);
 
         // Only the derived summary changes; the group list itself is correct
         // in place, so the tags are NOT rebuilt here.
@@ -3034,7 +3215,13 @@ class MetronomeApp {
 
         if (btn.classList.contains('group-tag-del')) {
           if (!Number.isInteger(gIdx)) return;
+          const ids = this.ensureGroupIds(layer);
+          const removedId = ids[gIdx];
           layer.groups.splice(gIdx, 1);
+          ids.splice(gIdx, 1);
+          // The group no longer exists: its draft must not survive to be
+          // applied to whichever group shifts into this index.
+          if (removedId) this.draftsFor(layer.id).delete(removedId);
           this.refreshLayerDetail(layer);
           if (activatedByFocus) this.focusAfterGroupDelete(layer, gIdx);
           return;
@@ -3042,9 +3229,14 @@ class MetronomeApp {
 
         if (btn.classList.contains('group-move-left')) {
           if (!Number.isInteger(gIdx) || gIdx <= 0) return;
+          const ids = this.ensureGroupIds(layer);
           const temp = layer.groups[gIdx];
           layer.groups[gIdx] = layer.groups[gIdx - 1];
           layer.groups[gIdx - 1] = temp;
+          // Move the stable id WITH its group, so the draft follows it.
+          const idTemp = ids[gIdx];
+          ids[gIdx] = ids[gIdx - 1];
+          ids[gIdx - 1] = idTemp;
           this.refreshLayerDetail(layer);
           if (activatedByFocus) this.focusGroupAction(layer, gIdx - 1, 'left');
           return;
@@ -3052,9 +3244,13 @@ class MetronomeApp {
 
         if (btn.classList.contains('group-move-right')) {
           if (!Number.isInteger(gIdx) || gIdx >= layer.groups.length - 1) return;
+          const ids = this.ensureGroupIds(layer);
           const temp = layer.groups[gIdx];
           layer.groups[gIdx] = layer.groups[gIdx + 1];
           layer.groups[gIdx + 1] = temp;
+          const idTemp = ids[gIdx];
+          ids[gIdx] = ids[gIdx + 1];
+          ids[gIdx + 1] = idTemp;
           this.refreshLayerDetail(layer);
           if (activatedByFocus) this.focusGroupAction(layer, gIdx + 1, 'right');
         }
@@ -3305,6 +3501,9 @@ class MetronomeApp {
   // the beat data itself is never touched by render state.
   applyConfiguration({ bpm, layers }) {
     this.state.bpm = bpm;
+    // The grouping data is being wholesale replaced. Any draft belongs to the
+    // OLD groups and must not be applied to the new configuration.
+    this.clearAllDrafts();
     this.state.layers = layers;
     this.state.clearVisualQueue();
     this.applyInitialExpansionState();

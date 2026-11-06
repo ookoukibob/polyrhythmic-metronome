@@ -761,6 +761,7 @@ function createApp(harness, options = {}) {
   app.currentPlayhead = new Map();
   app.pendingCellIndex = new Map();
   app.gridCursor = new Map();
+  app.groupDrafts = new Map();
 
   // Behaviour that belongs to the view layer.
   app.toasts = [];
