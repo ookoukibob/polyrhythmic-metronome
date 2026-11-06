@@ -223,7 +223,9 @@ test('Issue B: deleting a layer while playing drops its pending visual events', 
     !list(app.state.visualQueue).some((e) => e.layerId === doomed.id),
     'no event may reference the deleted layer'
   );
-  assert.equal(app.renderCount > 0, true);
+  // The card is removed surgically rather than rebuilding every card, so the
+  // removed id must no longer resolve to an element.
+  assert.equal(app.document.getElementById(doomed.id), null);
 });
 
 test('Issue B: removing the last remaining layer is refused', () => {

@@ -29,6 +29,46 @@ const METRONOME_LIMITS = Object.freeze({
 const METRONOME_SOUNDS = ['classic', 'wood', 'electronic', 'soft', 'cowbell'];
 const METRONOME_BEAT_TYPES = ['accent', 'normal', 'mute'];
 
+// Rendering thresholds for the layer list. Kept in one place so the collapse
+// policy is not re-derived in individual handlers.
+//
+// A layer's "detail" (grouping tags + subdivision grid) is what costs DOM:
+// a full 1024-subdivision card is ~9.3k nodes. Above these thresholds the
+// list starts collapsed and detail is built only when a layer is expanded.
+const LAYER_RENDER_POLICY = Object.freeze({
+  // Collapse detail by default when the configuration is at least this big.
+  autoCollapseLayerCount: 8,
+  autoCollapseTotalSubdivisions: 4000,
+  // A layer whose own subdivision count exceeds this also starts collapsed,
+  // even when the whole configuration is small (e.g. a single 59/16 layer is
+  // fine, but a single 1024-subdivision layer is not).
+  autoCollapseLayerSubdivisions: 512,
+});
+
+// Virtualisation budget for the per-layer detail. Detail content (group tags
+// and pattern cells) is mounted only for the slice near the viewport, so DOM
+// stays bounded no matter how many layers are expanded or how big they are.
+//
+// Measured sizes used to place spacers without measuring the DOM on every
+// scroll. They are intentionally the design constants from style.css; a real
+// measurement overrides them per layer on first render.
+const VIRTUAL_POLICY = Object.freeze({
+  // Extra items mounted above/below the visible slice, to hide scroll gaps.
+  overscanItems: 6,
+  // Force at least this many items mounted even when the viewport is unknown
+  // (e.g. first paint before layout has happened).
+  minWindowItems: 24,
+  // Below this many items, mounting everything is cheaper than virtualising.
+  fullRenderThreshold: 120,
+  // Fallback geometry, used until a layer's real size is measured.
+  fallbackTagWidth: 92,   // .group-tag incl. gap
+  fallbackTagHeight: 30,  // .group-tag height incl. row gap
+  fallbackCellWidth: 34,  // .subdiv-cell-wrap incl. gap
+  fallbackCellHeight: 60, // .subdiv-cell-wrap full height
+  // Deceleration window for scroll events: one rAF batch per frame.
+  scrollSettleMs: 16,
+});
+
 // Accept JSON numbers and numeric strings; reject NaN, Infinity and junk.
 function toFiniteNumber(value) {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null;
@@ -57,6 +97,165 @@ function normalizeName(value, fallback) {
   if (typeof value !== 'string') return fallback;
   const trimmed = value.trim().slice(0, METRONOME_LIMITS.maxNameLength);
   return trimmed || fallback;
+}
+
+// One group size, clamped to exactly the range normalizeGroups() accepts.
+// The UI uses this so it cannot produce a grouping that import would reject.
+function clampGroupValue(value) {
+  return clampInt(value, METRONOME_LIMITS.groupSize, METRONOME_LIMITS.groupSize.min);
+}
+
+// The import path compares the length of the encoded fragment it reads back
+// from location.hash. Export must measure the same string, otherwise a link
+// could be generated that this app refuses to load.
+function isPayloadWithinLimit(encodedHash) {
+  return typeof encodedHash === 'string' && encodedHash.length <= METRONOME_LIMITS.maxPayloadLength;
+}
+
+// ============================================================================
+// Virtualisation window maths (pure functions, no DOM)
+// ============================================================================
+//
+// Both the group-tag list and the pattern grid mount only a slice of their
+// items. These helpers turn "how much of the list is on screen" into an
+// [start, end) index range plus the spacer sizes that keep the scroll geometry
+// identical to a fully-rendered list.
+
+// Number of items in the viewport, given the item size along the scroll axis.
+function itemsPerViewport(viewportSize, itemSize) {
+  const size = toFiniteNumber(itemSize);
+  if (size === null || size <= 0) return 0;
+  const view = toFiniteNumber(viewportSize);
+  if (view === null || view <= 0) return 0;
+  return view / size;
+}
+
+/**
+ * Compute the mounted slice for a one-dimensional virtual list.
+ *
+ * `scrollOffset` is how far the list's own scroll position has advanced along
+ * its axis (0 when the list is laid out in normal page flow and only the page
+ * scrolls — see computeVisibleRange for that case).
+ *
+ * Returns { start, end, before, after } where [start, end) are the item indexes
+ * to mount and `before`/`after` are the spacer sizes before and after them, in
+ * items (multiply by the item size for pixels). `end` may equal `start` when
+ * there is nothing to mount, never less.
+ */
+function computeWindow({ total, viewportSize, itemSize, scrollOffset = 0, overscan = 0, minItems = 0 }) {
+  const count = toFiniteNumber(total);
+  if (count === null || count <= 0) {
+    return { start: 0, end: 0, before: 0, after: 0 };
+  }
+  const totalItems = Math.floor(count);
+  const size = toFiniteNumber(itemSize);
+  const view = toFiniteNumber(viewportSize);
+  const offset = Number.isFinite(toFiniteNumber(scrollOffset)) ? toFiniteNumber(scrollOffset) : 0;
+
+  // Degenerate geometry: mount everything rather than produce an empty window.
+  if (size === null || size <= 0 || view === null || view <= 0) {
+    return { start: 0, end: totalItems, before: 0, after: 0 };
+  }
+
+  const visibleCount = Math.max(1, Math.ceil(view / size) + 1);
+  const firstVisible = Math.floor(Math.max(0, offset) / size);
+
+  let start = firstVisible - overscan;
+  let end = firstVisible + visibleCount + overscan;
+
+  if (minItems > 0) {
+    const shortfall = minItems - (end - start);
+    if (shortfall > 0) {
+      end += shortfall;
+    }
+  }
+
+  start = Math.max(0, start);
+  end = Math.min(totalItems, end);
+  if (end < start) end = start;
+
+  return {
+    start,
+    end,
+    before: start,
+    after: totalItems - end,
+  };
+}
+
+/**
+ * Window for a list laid out in normal document flow (no inner scroller).
+ *
+ * `elementTop`/`elementHeight` describe the list's box in viewport
+ * coordinates; only the part that intersects [0, viewportHeight] is visible.
+ * Horizontal lists additionally use their own scrollLeft, since the pattern
+ * grid scrolls sideways inside the card.
+ */
+function computeVisibleRange({
+  total,
+  viewportStart,      // px, list coordinate == 0 at first item
+  viewportEnd,        // px
+  itemSize,
+  overscan = 0,
+  minItems = 0,
+  maxMount,           // hard cap on mounted items, 0/undefined = no cap
+}) {
+  const count = toFiniteNumber(total);
+  if (count === null || count <= 0) {
+    return { start: 0, end: 0, before: 0, after: 0 };
+  }
+  const totalItems = Math.floor(count);
+  const size = toFiniteNumber(itemSize);
+
+  if (size === null || size <= 0) {
+    return { start: 0, end: totalItems, before: 0, after: 0 };
+  }
+
+  const vStart = toFiniteNumber(viewportStart);
+  const vEnd = toFiniteNumber(viewportEnd);
+
+  // Unknown geometry: mount a conservative opening window, not everything.
+  if (vStart === null || vEnd === null) {
+    let start = 0;
+    let end = Math.max(1, minItems, 1);
+    end = Math.min(totalItems, end);
+    return { start, end, before: start, after: totalItems - end };
+  }
+
+  const firstVisible = Math.floor(Math.max(0, vStart) / size);
+  const visibleCount = Math.max(1, Math.ceil(Math.max(0, vEnd - vStart) / size) + 1);
+
+  let start = firstVisible - overscan;
+  let end = firstVisible + visibleCount + overscan;
+
+  if (minItems > 0) {
+    const shortfall = minItems - (end - start);
+    if (shortfall > 0) end += shortfall;
+  }
+
+  start = Math.max(0, start);
+  end = Math.min(totalItems, end);
+
+  if (maxMount && maxMount > 0 && end - start > maxMount) {
+    end = start + maxMount;
+  }
+
+  if (end < start) end = start;
+
+  return {
+    start,
+    end,
+    before: start,
+    after: totalItems - end,
+  };
+}
+
+// Effective window: small lists skip virtualisation entirely.
+function computeEffectiveWindow(total, window, threshold = VIRTUAL_POLICY.fullRenderThreshold) {
+  const count = Number.isFinite(total) ? Math.max(0, Math.floor(total)) : 0;
+  if (count <= threshold) {
+    return { start: 0, end: count, before: 0, after: 0, virtualized: false };
+  }
+  return { ...window, virtualized: true };
 }
 
 // Grouping is validated structurally only. Its SUM is deliberately NOT
@@ -805,6 +1004,14 @@ class MetronomeApp {
   }
 
   init() {
+    // Expansion state must exist before any card is built.
+    this.expandedLayerIds = new Set();
+
+    // Virtualisation bookkeeping: one observer per expanded layer, plus a
+    // coalescing set so a burst of resize/scroll signals costs one remount.
+    this.virtualObservers = new Map();
+    this.virtualRefreshQueued = new Map();
+
     // Check URL state first, otherwise load default
     if (!this.loadStateFromUrl()) {
       // Default directly to 59/16 signature metronome
@@ -812,11 +1019,50 @@ class MetronomeApp {
     }
 
     this.bindEvents();
+    this.bindVirtualScroll();
     this.renderAll();
     this.renderPresets();
 
     // Start requestAnimationFrame visual loop
     this.startVisualLoop();
+  }
+
+  // One passive scroll listener for the whole page, one rAF batch at a time.
+  // Individual cells never get their own scroll handlers.
+  bindVirtualScroll() {
+    if (this.virtualScrollBound) return;
+    this.virtualScrollBound = true;
+
+    let pending = false;
+    const onScroll = () => {
+      if (pending) return;
+      pending = true;
+      const flush = () => {
+        pending = false;
+        this.onPageScroll();
+      };
+      if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(flush);
+      } else {
+        setTimeout(flush, VIRTUAL_POLICY.scrollSettleMs);
+      }
+    };
+
+    if (typeof window !== 'undefined' && window.addEventListener) {
+      window.addEventListener('scroll', onScroll, { passive: true });
+      window.addEventListener('resize', onScroll, { passive: true });
+    }
+
+    // The pattern grid scrolls horizontally inside its own wrapper.
+    if (this.dom.layersList && this.dom.layersList.addEventListener) {
+      this.dom.layersList.addEventListener('scroll', (e) => {
+        const wrap = e.target && e.target.closest && e.target.closest('.subdivision-scroll-wrap');
+        if (!wrap) return;
+        const card = wrap.closest('.layer-card');
+        if (!card || !card.id) return;
+        this.scheduleVirtualRefresh(card.id);
+      }, { passive: true, capture: true });
+    }
   }
 
   // ==========================================================================
@@ -930,6 +1176,28 @@ class MetronomeApp {
     });
   }
 
+  // Single entry point for every UI path that adds a layer. The count is
+  // checked before anything is created, so a rejected add leaves the state
+  // completely untouched — no create-then-delete, no partial mutation.
+  addLayer(config = {}) {
+    if (this.state.layers.length >= METRONOME_LIMITS.maxLayers) {
+      this.showToast(`已达到 Layer 数量上限 (${METRONOME_LIMITS.maxLayers})，无法继续添加。`);
+      return false;
+    }
+
+    const newLayer = this.state.createLayer(config);
+    this.state.layers.push(newLayer);
+
+    // A newly added layer is small and worth showing in full.
+    this.expandedLayerIds.add(newLayer.id);
+
+    // Append just this card instead of rebuilding the whole list.
+    const card = this.createLayerCardElement(newLayer, this.state.layers.length - 1);
+    this.dom.layersList.appendChild(card);
+    this.updateLayerIndexes();
+    return true;
+  }
+
   // Removing a layer while playing must also drop its pending visual events
   // and cancel the voices it already scheduled: the layer element disappears,
   // so those events could only act on a stale id, and its clicks would
@@ -940,7 +1208,16 @@ class MetronomeApp {
     this.state.layers = this.state.layers.filter((l) => l.id !== layerId);
     this.state.visualQueue = this.state.visualQueue.filter((event) => event.layerId !== layerId);
     this.audioEngine.cancelScheduledVoices(layerId);
-    this.renderLayers();
+
+    // Drop the id from the UI-only expansion set so it cannot leak between
+    // configurations, and remove just that card.
+    this.expandedLayerIds.delete(layerId);
+    this.detachLayerVirtualObserver(layerId);
+    if (this.currentPlayhead) this.currentPlayhead.delete(layerId);
+    const card = document.getElementById(layerId);
+    if (card && card.parentNode) card.parentNode.removeChild(card);
+
+    this.updateLayerIndexes();
   }
 
   // Scheduler: runs every 25ms, schedules audio ahead of time in AudioContext
@@ -1011,6 +1288,12 @@ class MetronomeApp {
   }
 
   highlightBeat(layerId, subdivIndex) {
+    // Playback position is recorded regardless of what is mounted, so a cell
+    // that scrolls back into view can be painted with the current state. This
+    // never forces mounting — scheduling must not depend on DOM presence.
+    this.currentPlayhead = this.currentPlayhead || new Map();
+    this.currentPlayhead.set(layerId, subdivIndex);
+
     const layerEl = document.getElementById(layerId);
     if (!layerEl) return;
 
@@ -1020,7 +1303,7 @@ class MetronomeApp {
       prev.classList.remove('active-playhead');
     }
 
-    // Highlight current cell
+    // Highlight current cell — only if this index is currently mounted.
     const cell = layerEl.querySelector(`.subdiv-cell[data-index="${subdivIndex}"]`);
     if (!cell) return;
     cell.classList.add('active-playhead');
@@ -1032,11 +1315,15 @@ class MetronomeApp {
     // so a user's manual horizontal position is not reset every beat.
     const wrap = layerEl.querySelector('.subdivision-scroll-wrap');
     if (!wrap) return;
-    const wrapRect = wrap.getBoundingClientRect();
-    const cellRect = cell.getBoundingClientRect();
-    const cs = getComputedStyle(wrap);
-    const leftEdge = wrapRect.left + (parseFloat(cs.paddingLeft) || 0);
-    const rightEdge = wrapRect.right - (parseFloat(cs.paddingRight) || 0);
+    const wrapRect = this.rectOf(wrap);
+    const cellRect = this.rectOf(cell);
+    let leftEdge = wrapRect.left;
+    let rightEdge = wrapRect.right;
+    if (typeof getComputedStyle === 'function') {
+      const cs = getComputedStyle(wrap);
+      leftEdge += parseFloat(cs.paddingLeft) || 0;
+      rightEdge -= parseFloat(cs.paddingRight) || 0;
+    }
     let delta = 0;
     if (cellRect.left < leftEdge) {
       delta = cellRect.left - leftEdge;
@@ -1109,13 +1396,11 @@ class MetronomeApp {
 
     // Add Layer
     this.dom.addLayerBtn.addEventListener('click', () => {
-      const newLayer = this.state.createLayer({
+      this.addLayer({
         name: `Layer ${this.state.layers.length + 1}`,
         numerator: 16,
         denominator: 16,
       });
-      this.state.layers.push(newLayer);
-      this.renderLayers();
     });
 
     // Share URL
@@ -1130,11 +1415,10 @@ class MetronomeApp {
   }
 
   setBpm(newBpm) {
-    if (isNaN(newBpm)) newBpm = 120;
-    newBpm = Math.max(20, Math.min(600, Math.round(newBpm)));
-    this.state.bpm = newBpm;
-    this.dom.bpmInput.value = newBpm;
-    this.dom.bpmSlider.value = newBpm;
+    // Shared limit, so the UI cannot set a BPM that import would clamp.
+    this.state.bpm = clampInt(newBpm, METRONOME_LIMITS.bpm, 120);
+    this.dom.bpmInput.value = this.state.bpm;
+    this.dom.bpmSlider.value = this.state.bpm;
   }
 
   handleTap() {
@@ -1193,11 +1477,54 @@ class MetronomeApp {
     this.renderLayers();
   }
 
+  // Collapse policy, applied when a configuration is swapped in (preset load,
+  // URL import) rather than on every incremental re-render.
+  shouldStartCollapsed(layer) {
+    const policy = LAYER_RENDER_POLICY;
+    if (layer.numerator > policy.autoCollapseLayerSubdivisions) return true;
+    if (this.state.layers.length >= policy.autoCollapseLayerCount) return true;
+
+    let total = 0;
+    for (const l of this.state.layers) {
+      total += l.numerator;
+      if (total > policy.autoCollapseTotalSubdivisions) return true;
+    }
+    return false;
+  }
+
+  // Apply the default expansion state for the configuration now in state.
+  // Small configurations keep the historical behaviour (everything expanded).
+  applyInitialExpansionState() {
+    this.expandedLayerIds = new Set();
+    for (const layer of this.state.layers) {
+      if (!this.shouldStartCollapsed(layer)) {
+        this.expandedLayerIds.add(layer.id);
+      }
+    }
+  }
+
+  isLayerExpanded(layerId) {
+    return this.expandedLayerIds.has(layerId);
+  }
+
+  // Full rebuild of the list. Used when the set of layers changes (load,
+  // import, add, remove) — individual edits take a narrower path below.
   renderLayers() {
-    this.dom.layersList.innerHTML = '';
+    const fragment = document.createDocumentFragment();
     this.state.layers.forEach((layer, index) => {
-      const card = this.createLayerCardElement(layer, index);
-      this.dom.layersList.appendChild(card);
+      fragment.appendChild(this.createLayerCardElement(layer, index));
+    });
+    this.dom.layersList.replaceChildren(fragment);
+    this.updateLayerIndexes();
+  }
+
+  // Renumber the #N tags without touching anything else.
+  updateLayerIndexes() {
+    this.state.layers.forEach((layer, index) => {
+      const card = document.getElementById(layer.id);
+      if (!card) return;
+      const tag = card.querySelector('.layer-tag');
+      if (tag) tag.textContent = `#${index + 1}`;
     });
   }
 
@@ -1205,14 +1532,37 @@ class MetronomeApp {
     const card = document.createElement('div');
     card.className = `layer-card ${layer.muted ? 'muted' : ''}`;
     card.id = layer.id;
+    const expanded = this.isLayerExpanded(layer.id);
+    card.dataset.expanded = expanded ? '1' : '0';
+    if (!expanded) card.classList.add('collapsed');
 
-    // Calculate grouping sum & validation
-    const groupSum = layer.groups.reduce((a, b) => a + b, 0);
-    const isSumValid = groupSum === layer.numerator;
-    const diff = groupSum - layer.numerator;
-    const diffText = diff > 0 ? `+${diff}` : `${diff}`;
+    const accentBar = document.createElement('div');
+    accentBar.className = 'layer-accent-bar';
+    accentBar.style.background = layer.color;
+    card.appendChild(accentBar);
 
-    card.innerHTML = `
+    const main = document.createElement('div');
+    main.className = 'layer-main';
+    main.innerHTML = this.layerHeaderHtml(layer, index);
+
+    // Detail host: always present, contents depend on expansion state.
+    const detailHost = document.createElement('div');
+    detailHost.className = 'layer-detail';
+    main.appendChild(detailHost);
+    card.appendChild(main);
+
+    this.bindLayerHeaderEvents(card, layer);
+
+    if (expanded) {
+      this.renderLayerDetail(layer, card);
+    }
+
+    return card;
+  }
+
+  // Header + controls only. No grouping tags, no subdivision cells.
+  layerHeaderHtml(layer, index) {
+    return `
       <div class="layer-accent-bar" style="background: ${layer.color};"></div>
       <div class="layer-main">
 
@@ -1221,6 +1571,7 @@ class MetronomeApp {
           <div class="layer-title-group">
             <span class="layer-tag" style="background: ${layer.color}22; color: ${layer.color};">#${index + 1}</span>
             <input type="text" class="layer-name-input" value="${this.escapeHtml(layer.name)}">
+            <span class="layer-summary">${this.layerSummaryText(layer)}</span>
           </div>
 
           <!-- Time Signature Input -->
@@ -1264,154 +1615,641 @@ class MetronomeApp {
             </div>
 
             <div class="layer-btn-actions">
+              <button class="expand-btn" title="展开 / 折叠该 Layer 的详细内容">${this.isLayerExpanded(layer.id) ? '▾' : '▸'}</button>
               <button class="mute-btn ${layer.muted ? 'active' : ''}">MUTE</button>
               ${this.state.layers.length > 1 ? '<button class="del-layer-btn" title="删除当前 Layer">✕</button>' : ''}
             </div>
           </div>
         </div>
+    `;
+  }
 
-        <!-- Grouping Bar -->
-        <div class="grouping-bar">
-          <div class="grouping-top">
-            <div class="grouping-info">
-              <span class="grouping-title">节奏分组 (Grouping)</span>
-              <span class="grouping-sum-badge ${isSumValid ? '' : 'error'}">
-                ${isSumValid ? `和 = ${groupSum} ✓` : `和 = ${groupSum} / 需 ${layer.numerator} (${diffText})`}
-              </span>
-            </div>
+  // Compact one-line summary shown while collapsed, so a collapsed layer still
+  // communicates its grouping state without building the full editor.
+  layerSummaryText(layer) {
+    const groupSum = layer.groups.reduce((a, b) => a + b, 0);
+    const valid = groupSum === layer.numerator;
+    const groups = layer.groups.length;
+    return valid
+      ? `${groups} 组 · 和 ${groupSum} ✓`
+      : `${groups} 组 · 和 ${groupSum}/${layer.numerator}`;
+  }
 
-            <div class="grouping-quick-actions">
-              <button class="btn btn-sm btn-auto-group" title="按3+3+2模式自动填充">自动分组</button>
-              <button class="btn btn-sm btn-even-group" title="在当前组数间平均分配拍数">平均分配</button>
-              <button class="btn btn-sm btn-group-accent" title="将各组起点标记为重音">组首重音</button>
-              <button class="btn btn-sm btn-clear-group" title="清空所有分组">清空</button>
-            </div>
+  groupingBadgeHtml(layer) {
+    const groupSum = layer.groups.reduce((a, b) => a + b, 0);
+    const isSumValid = groupSum === layer.numerator;
+    const diff = groupSum - layer.numerator;
+    const diffText = diff > 0 ? `+${diff}` : `${diff}`;
+    return isSumValid
+      ? `和 = ${groupSum} ✓`
+      : `和 = ${groupSum} / 需 ${layer.numerator} (${diffText})`;
+  }
+
+  // Build (or rebuild) the expandable part of one card.
+  renderLayerDetail(layer, card) {
+    const host = card.querySelector('.layer-detail');
+    if (!host) return;
+
+    host.innerHTML = `
+      <div class="grouping-bar">
+        <div class="grouping-top">
+          <div class="grouping-info">
+            <span class="grouping-title">节奏分组 (Grouping)</span>
+            <span class="grouping-sum-badge ${this.groupingBadgeHtml(layer).includes('✓') ? '' : 'error'}">${this.groupingBadgeHtml(layer)}</span>
           </div>
 
-          <!-- Group Tags Editor -->
-          <div class="groups-tags-container">
-            ${layer.groups.map((val, gIdx) => `
-              <div class="group-tag" data-gidx="${gIdx}">
-                ${gIdx > 0 ? '<button class="group-tag-btn group-move-left" title="左移">◀</button>' : ''}
-                <input type="number" class="group-tag-val" min="1" max="512" value="${val}">
-                ${gIdx < layer.groups.length - 1 ? '<button class="group-tag-btn group-move-right" title="右移">▶</button>' : ''}
-                <button class="group-tag-btn group-tag-del" title="删除该组">×</button>
-              </div>
-            `).join('')}
-            <button class="add-group-btn">+ 添加组</button>
-          </div>
-        </div>
-
-        <!-- Subdivision Interactive Grid -->
-        <div class="grid-container">
-          <div class="grid-top-actions">
-            <div class="grid-legend">
-              <div class="legend-item"><span class="legend-dot accent"></span> ● 重音 (Accent)</div>
-              <div class="legend-item"><span class="legend-dot normal"></span> ○ 普音 (Normal)</div>
-              <div class="legend-item"><span class="legend-dot mute"></span> × 静音 (Mute)</div>
-              <span style="color: var(--text-muted); margin-left: 6px;">(点击任意单元格循环切换)</span>
-            </div>
-
-            <div class="grid-action-btns">
-              <button class="btn btn-sm btn-reset-pattern" title="恢复为分组默认重音">重置 Pattern</button>
-              <button class="btn btn-sm btn-all-normal" title="全部设为普通音">全部普音</button>
-              <button class="btn btn-sm btn-random-pattern" title="随机生成重音/静音">随机 Pattern</button>
-            </div>
-          </div>
-
-          <!-- Scrollable Cells -->
-          <div class="subdivision-scroll-wrap">
-            <div class="subdivision-grid">
-              ${this.renderSubdivisionCellsHtml(layer)}
-            </div>
+          <div class="grouping-quick-actions">
+            <button class="btn btn-sm btn-auto-group" title="按3+3+2模式自动填充">自动分组</button>
+            <button class="btn btn-sm btn-even-group" title="在当前组数间平均分配拍数">平均分配</button>
+            <button class="btn btn-sm btn-group-accent" title="将各组起点标记为重音">组首重音</button>
+            <button class="btn btn-sm btn-clear-group" title="清空所有分组">清空</button>
           </div>
         </div>
 
+        <div class="groups-tags-container">
+          <div class="groups-tags-list" data-virtual="groups"></div>
+          <button class="add-group-btn">+ 添加组</button>
+        </div>
+      </div>
+
+      <div class="grid-container">
+        <div class="grid-top-actions">
+          <div class="grid-legend">
+            <div class="legend-item"><span class="legend-dot accent"></span> ● 重音 (Accent)</div>
+            <div class="legend-item"><span class="legend-dot normal"></span> ○ 普音 (Normal)</div>
+            <div class="legend-item"><span class="legend-dot mute"></span> × 静音 (Mute)</div>
+            <span style="color: var(--text-muted); margin-left: 6px;">(点击任意单元格循环切换)</span>
+          </div>
+
+          <div class="grid-action-btns">
+            <button class="btn btn-sm btn-reset-pattern" title="恢复为分组默认重音">重置 Pattern</button>
+            <button class="btn btn-sm btn-all-normal" title="全部设为普通音">全部普音</button>
+            <button class="btn btn-sm btn-random-pattern" title="随机生成重音/静音">随机 Pattern</button>
+          </div>
+        </div>
+
+        <div class="subdivision-scroll-wrap">
+          <div class="subdivision-grid" data-virtual="cells"></div>
+        </div>
       </div>
     `;
 
-    this.bindLayerCardEvents(card, layer);
-    return card;
+    this.bindLayerDetailEvents(card, layer);
+    this.mountLayerVirtualWindows(layer, card);
+    this.attachLayerVirtualObserver(layer, card);
   }
 
-  renderSubdivisionCellsHtml(layer) {
-    const cellsHtml = [];
-    let groupStartIndices = new Set();
+  // --------------------------------------------------------------------------
+  // Virtualised mounting for the two large per-layer collections
+  // --------------------------------------------------------------------------
+  //
+  // Both collections are rebuilt from `layer` on every window change, so the
+  // DOM never holds a stale copy: state stays the only source of truth.
+
+  mountLayerVirtualWindows(layer, card) {
+    this.mountGroupWindow(layer, card);
+    this.mountCellWindow(layer, card);
+  }
+
+  // --- Group tags -----------------------------------------------------------
+  //
+  // Tags are a wrapping flex flow, so the whole list has a fixed measured
+  // height and items are ordered by row then column. Virtualising by item index
+  // keeps every mounting order simple; the spacers only need to reserve the
+  // height of the skipped rows.
+
+  mountGroupWindow(layer, card) {
+    const host = card.querySelector('.groups-tags-list');
+    if (!host) return;
+    // A real (viewport-driven) mount supersedes any minimal mount.
+    host.__minimal = false;
+
+    const total = layer.groups.length;
+    const geom = this.getGroupGeometry(host, layer);
+    const perRow = geom.itemsPerRow;
+
+    const hostRect = this.rectOf(host);
+    // Tags scroll with the page, so the visible slice is expressed in the
+    // list's own coordinate space.
+    const visible = computeVisibleRange({
+      total,
+      viewportStart: -hostRect.top,
+      viewportEnd: this.viewportHeight() - hostRect.top,
+      itemSize: geom.rowHeight,
+      overscan: VIRTUAL_POLICY.overscanItems,
+      minItems: VIRTUAL_POLICY.minWindowItems,
+    });
+    const win = computeEffectiveWindow(total, visible);
+
+    // Convert the row-based window into an item index range, snapped to whole
+    // rows so the mounted block always wraps the same way as the full list.
+    const firstRow = Math.floor(win.start / perRow);
+    const lastRow = Math.ceil(win.end / perRow);
+    const start = Math.max(0, firstRow * perRow);
+    const end = Math.min(total, lastRow * perRow);
+
+    const parts = [];
+    for (let i = start; i < end; i++) {
+      parts.push(this.groupTagHtml(layer, i));
+    }
+
+    // Spacers are whole rows, which is what flex-wrap actually lays out.
+    const beforeRows = Math.floor(start / perRow);
+    const afterRows = Math.max(0, geom.totalRows - Math.ceil(end / perRow));
+    const beforeH = beforeRows * geom.rowHeight;
+    const afterH = afterRows * geom.rowHeight;
+
+    host.innerHTML = '';
+    if (beforeH > 0) {
+      const spacer = document.createElement('div');
+      spacer.className = 'virtual-spacer';
+      spacer.style.height = `${beforeH}px`;
+      host.appendChild(spacer);
+    }
+
+    const row = document.createElement('div');
+    row.className = 'groups-tags-mounted';
+    row.innerHTML = parts.join('');
+    host.appendChild(row);
+
+    if (afterH > 0) {
+      const spacer = document.createElement('div');
+      spacer.className = 'virtual-spacer';
+      spacer.style.height = `${afterH}px`;
+      host.appendChild(spacer);
+    }
+
+    layer.__virtual = layer.__virtual || {};
+    layer.__virtual.groups = { start, end };
+  }
+
+  // --- Pattern cells --------------------------------------------------------
+
+  mountCellWindow(layer, card) {
+    const grid = card.querySelector('.subdivision-grid');
+    if (!grid) return;
+    grid.__minimal = false;
+
+    const wrap = card.querySelector('.subdivision-scroll-wrap');
+    const total = layer.numerator;
+    const geom = this.getCellGeometry(grid);
+
+    // The grid is a horizontal scroller inside the card.
+    const wrapWidth = wrap && wrap.clientWidth ? wrap.clientWidth : this.viewportWidth();
+    const scrollLeft = wrap ? wrap.scrollLeft : 0;
+
+    const visible = computeVisibleRange({
+      total,
+      viewportStart: scrollLeft,
+      viewportEnd: scrollLeft + wrapWidth,
+      itemSize: geom.itemWidth,
+      overscan: VIRTUAL_POLICY.overscanItems,
+      minItems: VIRTUAL_POLICY.minWindowItems,
+    });
+    const win = computeEffectiveWindow(total, visible);
+
+    const starts = this.groupStartSet(layer);
+    const parts = [];
+    for (let i = win.start; i < win.end; i++) {
+      parts.push(this.subdivCellHtml(layer, i, starts));
+    }
+
+    const beforeW = win.before * geom.itemWidth;
+    const afterW = win.after * geom.itemWidth;
+
+    grid.innerHTML = '';
+    if (beforeW > 0) {
+      const spacer = document.createElement('div');
+      spacer.className = 'virtual-spacer-h';
+      spacer.style.width = `${beforeW}px`;
+      grid.appendChild(spacer);
+    }
+
+    const band = document.createElement('div');
+    band.className = 'subdiv-cells-mounted';
+    band.innerHTML = parts.join('');
+    grid.appendChild(band);
+
+    if (afterW > 0) {
+      const spacer = document.createElement('div');
+      spacer.className = 'virtual-spacer-h';
+      spacer.style.width = `${afterW}px`;
+      grid.appendChild(spacer);
+    }
+
+    layer.__virtual = layer.__virtual || {};
+    layer.__virtual.cells = { start: win.start, end: win.end };
+    layer.__virtual.starts = starts;
+  }
+
+  groupStartSet(layer) {
+    const starts = new Set();
     let pos = 0;
     layer.groups.forEach((size) => {
-      groupStartIndices.add(pos);
+      starts.add(pos);
       pos += size;
     });
+    return starts;
+  }
 
-    for (let i = 0; i < layer.numerator; i++) {
-      const type = this.state.getBeatType(layer, i);
-      const isGroupStart = groupStartIndices.has(i) && i > 0;
-      const symbol = type === 'accent' ? '●' : (type === 'mute' ? '×' : '○');
+  groupTagHtml(layer, gIdx) {
+    const val = layer.groups[gIdx];
+    const isFirst = gIdx === 0;
+    const isLast = gIdx === layer.groups.length - 1;
+    return (
+      `<div class="group-tag" data-gidx="${gIdx}">` +
+        (isFirst ? '' : '<button class="group-tag-btn group-move-left" title="左移">◀</button>') +
+        `<input type="number" class="group-tag-val" min="1" max="512" value="${val}">` +
+        (isLast ? '' : '<button class="group-tag-btn group-move-right" title="右移">▶</button>') +
+        '<button class="group-tag-btn group-tag-del" title="删除该组">×</button>' +
+      '</div>'
+    );
+  }
 
-      cellsHtml.push(`
-        <div class="subdiv-cell-wrap ${isGroupStart ? 'group-start' : ''}">
-          <div class="subdiv-cell ${type}" data-index="${i}" title="第 ${i + 1} 拍：${type}">
-            <span class="cell-icon">${symbol}</span>
-          </div>
-          <span class="cell-num">${i + 1}</span>
+  subdivCellHtml(layer, index, starts) {
+    const type = this.state.getBeatType(layer, index);
+    const isGroupStart = starts.has(index) && index > 0;
+    const symbol = type === 'accent' ? '●' : (type === 'mute' ? '×' : '○');
+    // A cell mounted while playing must show the current playhead immediately;
+    // otherwise scrolling during playback would show stale visual state.
+    const isPlayhead = this.currentPlayhead &&
+      this.currentPlayhead.get(layer.id) === index &&
+      this.state.isPlaying;
+    return `
+      <div class="subdiv-cell-wrap ${isGroupStart ? 'group-start' : ''}">
+        <div class="subdiv-cell ${type}${isPlayhead ? ' active-playhead' : ''}" data-index="${index}" title="第 ${index + 1} 拍：${type}">
+          <span class="cell-icon">${symbol}</span>
         </div>
-      `);
+        <span class="cell-num">${index + 1}</span>
+      </div>
+    `;
+  }
+
+  // --- Geometry -------------------------------------------------------------
+
+  rectOf(el) {
+    if (el && typeof el.getBoundingClientRect === 'function') {
+      const r = el.getBoundingClientRect();
+      if (r && Number.isFinite(r.top)) return r;
     }
-    return cellsHtml.join('');
+    return { top: 0, left: 0, width: 0, height: 0, bottom: 0, right: 0 };
+  }
+
+  viewportHeight() {
+    const win = (typeof window !== 'undefined' && window) || {};
+    const h = win.innerHeight;
+    return Number.isFinite(h) && h > 0 ? h : 800;
+  }
+
+  viewportWidth() {
+    const win = (typeof window !== 'undefined' && window) || {};
+    const w = win.innerWidth;
+    return Number.isFinite(w) && w > 0 ? w : 1280;
+  }
+
+  // Measured tag geometry, cached on the layer so scrolling does not remeasure.
+  // Tags wrap, so the unit of layout is a row: how many fit per line and how
+  // tall each line is.
+  getGroupGeometry(host, layer) {
+    const cached = host.__geom;
+    if (cached && cached.rowHeight > 0 && cached.itemsPerRow > 0) return cached;
+
+    const total = layer ? layer.groups.length : (host.querySelectorAll('.group-tag').length || 1);
+
+    let itemWidth = VIRTUAL_POLICY.fallbackTagWidth;
+    let rowHeight = VIRTUAL_POLICY.fallbackTagHeight;
+
+    const first = host.querySelector('.group-tag');
+    if (first) {
+      const r = this.rectOf(first);
+      if (r.width > 0) itemWidth = r.width + 8;   // flex column gap
+      if (r.height > 0) rowHeight = r.height + 8; // flex row gap
+    }
+
+    const availWidth = host.clientWidth || this.viewportWidth() - 80;
+    const itemsPerRow = Math.max(1, Math.floor(availWidth / itemWidth));
+
+    const geom = {
+      itemWidth,
+      rowHeight,
+      itemsPerRow,
+      totalRows: Math.ceil(total / itemsPerRow),
+    };
+    host.__geom = geom;
+    return geom;
+  }
+
+  getCellGeometry(grid) {
+    const cached = grid.__geom;
+    if (cached && cached.itemWidth > 0) return cached;
+
+    const first = grid.querySelector('.subdiv-cell-wrap');
+    let itemWidth = VIRTUAL_POLICY.fallbackCellWidth;
+    if (first) {
+      const r = this.rectOf(first);
+      if (r.width > 0) itemWidth = r.width + 2; // flex gap
+    }
+    const geom = { itemWidth };
+    grid.__geom = geom;
+    return geom;
+  }
+
+  // Observe the two virtual hosts of one layer. Recreated whenever the detail
+  // DOM is rebuilt; torn down when the layer collapses or is removed.
+  attachLayerVirtualObserver(layer, card) {
+    this.detachLayerVirtualObserver(layer.id);
+    if (typeof ResizeObserver !== 'function') return;
+
+    const tagsHost = card.querySelector('.groups-tags-list');
+    const grid = card.querySelector('.subdivision-grid');
+    const wrap = card.querySelector('.subdivision-scroll-wrap');
+    if (!tagsHost && !grid) return;
+
+    const observer = new ResizeObserver(() => this.scheduleVirtualRefresh(layer.id));
+    if (tagsHost) observer.observe(tagsHost);
+    if (grid) observer.observe(grid);
+    if (wrap) observer.observe(wrap);
+
+    this.virtualObservers.set(layer.id, observer);
+  }
+
+  detachLayerVirtualObserver(layerId) {
+    const observer = this.virtualObservers.get(layerId);
+    if (observer) {
+      try { observer.disconnect(); } catch (e) { /* already gone */ }
+      this.virtualObservers.delete(layerId);
+    }
+    const scheduled = this.virtualRefreshQueued.get(layerId);
+    if (scheduled !== undefined) {
+      this.virtualRefreshQueued.delete(layerId);
+    }
+  }
+
+  // Coalesce many resize/scroll signals into one rAF-batched remount per layer.
+  scheduleVirtualRefresh(layerId) {
+    if (this.virtualRefreshQueued.has(layerId)) return;
+    this.virtualRefreshQueued.set(layerId, true);
+
+    const run = () => {
+      this.virtualRefreshQueued.delete(layerId);
+      this.refreshLayerVirtualWindows(layerId);
+    };
+
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(run);
+    } else {
+      setTimeout(run, VIRTUAL_POLICY.scrollSettleMs);
+    }
+  }
+
+  refreshLayerVirtualWindows(layerId) {
+    const layer = this.state.layers.find((l) => l.id === layerId);
+    if (!layer || !this.isLayerExpanded(layerId)) return;
+    const card = document.getElementById(layerId);
+    if (!card) return;
+
+    this.mountGroupWindow(layer, card);
+    this.mountCellWindow(layer, card);
+  }
+
+  // Called once per animation frame while the page scrolls: refresh only the
+  // expanded layers whose virtual host is near the viewport.
+  onPageScroll() {
+    const vh = this.viewportHeight();
+    for (const layer of this.state.layers) {
+      if (!this.isLayerExpanded(layer.id)) continue;
+      const card = document.getElementById(layer.id);
+      if (!card) continue;
+
+      const r = this.rectOf(card);
+      // Far outside the viewport: shrink the layer's detail to its minimum so
+      // off-screen layers do not keep a full window mounted while scrolling.
+      // It is rebuilt the moment it comes back into range.
+      if (r.height > 0 && (r.bottom < -vh || r.top > vh * 2)) {
+        this.collapseVirtualWindow(layer.id);
+        continue;
+      }
+      this.scheduleVirtualRefresh(layer.id);
+    }
+  }
+
+  // Reduce an expanded layer's mounted detail to the smallest legal window.
+  // Used while the layer is far off-screen; state is untouched.
+  collapseVirtualWindow(layerId) {
+    const layer = this.state.layers.find((l) => l.id === layerId);
+    if (!layer || !this.isLayerExpanded(layerId)) return;
+    const card = document.getElementById(layerId);
+    if (!card) return;
+
+    const tagsHost = card.querySelector('.groups-tags-list');
+    if (tagsHost && !(tagsHost.__minimal)) {
+      tagsHost.__minimal = true;
+      this.renderMinimalGroupWindow(layer, card);
+    }
+
+    const grid = card.querySelector('.subdivision-grid');
+    if (grid && !grid.__minimal) {
+      grid.__minimal = true;
+      this.renderMinimalCellWindow(layer, card);
+    }
+  }
+
+  // Smallest mount that still keeps the list's geometry: a handful of rows for
+  // tags, a handful of cells for the grid, with spacers for the rest.
+  renderMinimalGroupWindow(layer, card) {
+    const host = card.querySelector('.groups-tags-list');
+    if (!host) return;
+    const total = layer.groups.length;
+    const geom = this.getGroupGeometry(host, layer);
+    const perRow = geom.itemsPerRow;
+
+    const mountRows = 2;
+    const end = Math.min(total, perRow * mountRows);
+
+    const parts = [];
+    for (let i = 0; i < end; i++) parts.push(this.groupTagHtml(layer, i));
+
+    const afterRows = Math.max(0, geom.totalRows - mountRows);
+    host.innerHTML = '';
+
+    const row = document.createElement('div');
+    row.className = 'groups-tags-mounted';
+    row.innerHTML = parts.join('');
+    host.appendChild(row);
+
+    if (afterRows > 0) {
+      const spacer = document.createElement('div');
+      spacer.className = 'virtual-spacer';
+      spacer.style.height = `${afterRows * geom.rowHeight}px`;
+      host.appendChild(spacer);
+    }
+
+    layer.__virtual = layer.__virtual || {};
+    layer.__virtual.groups = { start: 0, end };
+  }
+
+  renderMinimalCellWindow(layer, card) {
+    const grid = card.querySelector('.subdivision-grid');
+    if (!grid) return;
+    const total = layer.numerator;
+    const geom = this.getCellGeometry(grid);
+
+    const mountCount = Math.min(total, VIRTUAL_POLICY.minWindowItems);
+    const starts = this.groupStartSet(layer);
+
+    const parts = [];
+    for (let i = 0; i < mountCount; i++) parts.push(this.subdivCellHtml(layer, i, starts));
+
+    const afterW = Math.max(0, (total - mountCount) * geom.itemWidth);
+    grid.innerHTML = '';
+
+    const band = document.createElement('div');
+    band.className = 'subdiv-cells-mounted';
+    band.innerHTML = parts.join('');
+    grid.appendChild(band);
+
+    if (afterW > 0) {
+      const spacer = document.createElement('div');
+      spacer.className = 'virtual-spacer-h';
+      spacer.style.width = `${afterW}px`;
+      grid.appendChild(spacer);
+    }
+
+    layer.__virtual = layer.__virtual || {};
+    layer.__virtual.cells = { start: 0, end: mountCount };
+  }
+
+  // Refresh only the cheap derived bits of a card (summary + badge), leaving
+  // grouping tags and subdivision cells untouched.
+  refreshLayerSummary(layer) {
+    const card = document.getElementById(layer.id);
+    if (!card) return;
+    const summary = card.querySelector('.layer-summary');
+    if (summary) summary.textContent = this.layerSummaryText(layer);
+    const badge = card.querySelector('.grouping-sum-badge');
+    if (badge) {
+      const text = this.groupingBadgeHtml(layer);
+      badge.textContent = text;
+      badge.classList.toggle('error', !text.includes('✓'));
+    }
+  }
+
+  // Rebuild one layer's detail without touching any other layer.
+  refreshLayerDetail(layer) {
+    const card = document.getElementById(layer.id);
+    if (!card || !this.isLayerExpanded(layer.id)) return;
+    this.renderLayerDetail(layer, card);
+    this.refreshLayerSummary(layer);
+  }
+
+  // Expand or collapse a single layer. Collapsing drops the detail DOM but
+  // keeps every value in state, so re-expanding rebuilds from the truth.
+  setLayerExpanded(layerId, expanded) {
+    const layer = this.state.layers.find((l) => l.id === layerId);
+    if (!layer) return;
+
+    const card = document.getElementById(layerId);
+    if (!card) return;
+
+    if (expanded) {
+      this.expandedLayerIds.add(layerId);
+    } else {
+      this.expandedLayerIds.delete(layerId);
+    }
+
+    card.dataset.expanded = expanded ? '1' : '0';
+    card.classList.toggle('collapsed', !expanded);
+
+    const btn = card.querySelector('.expand-btn');
+    if (btn) btn.textContent = expanded ? '▾' : '▸';
+
+    const host = card.querySelector('.layer-detail');
+    if (!host) return;
+
+    if (expanded) {
+      this.renderLayerDetail(layer, card);
+    } else {
+      // Release the detail DOM entirely; state is unaffected. The observer is
+      // torn down too, so a collapsed layer keeps no live watchers.
+      this.detachLayerVirtualObserver(layerId);
+      host.replaceChildren();
+    }
+  }
+
+  toggleLayerExpanded(layerId) {
+    this.setLayerExpanded(layerId, !this.isLayerExpanded(layerId));
   }
 
   // ==========================================================================
   // Layer Card Event Listeners
   // ==========================================================================
 
-  bindLayerCardEvents(card, layer) {
+  // Events for the always-present header controls.
+  bindLayerHeaderEvents(card, layer) {
     // Name
     const nameInput = card.querySelector('.layer-name-input');
     nameInput.addEventListener('change', (e) => {
-      layer.name = e.target.value.trim() || layer.name;
+      // Keep the stored name inside the same length normalizeName() enforces,
+      // so a saved preset round-trips without being silently truncated.
+      const next = normalizeName(e.target.value, layer.name);
+      layer.name = next;
+      e.target.value = next;
     });
 
-    // Numerator
+    // Expand / collapse this layer's detail.
+    const expandBtn = card.querySelector('.expand-btn');
+    if (expandBtn) {
+      expandBtn.addEventListener('click', () => this.toggleLayerExpanded(layer.id));
+    }
+
+    // Numerator. Changing it rebuilds the grouping, so only THIS layer's
+    // detail is refreshed — the other cards keep their DOM and state.
     const numInput = card.querySelector('.meter-num-input');
     numInput.addEventListener('change', (e) => {
-      const newNum = Math.max(1, Math.min(1024, parseInt(e.target.value, 10) || 1));
+      const newNum = clampInt(e.target.value, METRONOME_LIMITS.numerator, layer.numerator);
+      e.target.value = newNum;
       if (newNum !== layer.numerator) {
         layer.numerator = newNum;
         layer.groups = this.state.autoGroup(newNum);
         layer.overrides = {};
-        this.renderLayers();
+        this.refreshLayerDetail(layer);
       }
     });
 
     // Denominator
     const denInput = card.querySelector('.meter-den-input');
     denInput.addEventListener('change', (e) => {
-      const newDen = Math.max(1, Math.min(256, parseInt(e.target.value, 10) || 1));
+      const newDen = clampInt(e.target.value, METRONOME_LIMITS.denominator, layer.denominator);
       layer.denominator = newDen;
+      e.target.value = newDen;
     });
 
     // Sound selection
     const soundSelect = card.querySelector('.select-sound');
     soundSelect.addEventListener('change', (e) => {
-      layer.sound = e.target.value;
+      layer.sound = METRONOME_SOUNDS.includes(e.target.value) ? e.target.value : 'classic';
     });
 
     // Volume
     const volSlider = card.querySelector('.vol-slider');
     volSlider.addEventListener('input', (e) => {
-      layer.volume = parseFloat(e.target.value);
+      // Range inputs are visually bounded, but the stored value is what gets
+      // saved and exported — keep it inside the shared limits regardless.
+      layer.volume = clampNumber(e.target.value, METRONOME_LIMITS.volume, layer.volume);
     });
 
     // Accent Volume
     const accSlider = card.querySelector('.accent-slider');
     accSlider.addEventListener('input', (e) => {
-      layer.accentVolume = parseFloat(e.target.value);
+      layer.accentVolume = clampNumber(e.target.value, METRONOME_LIMITS.accentVolume, layer.accentVolume);
     });
 
     // Multiplier
     const mulInput = card.querySelector('.multiplier-input');
     mulInput.addEventListener('change', (e) => {
-      layer.bpmMultiplier = Math.max(0.1, Math.min(8.0, parseFloat(e.target.value) || 1.0));
+      const next = clampNumber(e.target.value, METRONOME_LIMITS.bpmMultiplier, layer.bpmMultiplier);
+      layer.bpmMultiplier = next;
+      e.target.value = next;
     });
 
     // Mute toggle
@@ -1431,14 +2269,19 @@ class MetronomeApp {
         }
       });
     }
+  }
 
+  // Events for the expandable detail (grouping tags + subdivision grid).
+  // Rewired every time the detail DOM is rebuilt, and never registered on
+  // collapsed cards because their detail is empty.
+  bindLayerDetailEvents(card, layer) {
     // --- Grouping Operations ---
 
     // Auto Group
     card.querySelector('.btn-auto-group').addEventListener('click', () => {
       layer.groups = this.state.autoGroup(layer.numerator);
       layer.overrides = {};
-      this.renderLayers();
+      this.refreshLayerDetail(layer);
     });
 
     // Even Group
@@ -1446,9 +2289,13 @@ class MetronomeApp {
       const count = Math.max(1, layer.groups.length);
       const base = Math.floor(layer.numerator / count);
       const rem = layer.numerator % count;
-      layer.groups = Array.from({ length: count }, (_, i) => base + (i < rem ? 1 : 0));
+      // When there are more groups than beats, base is 0 — clamp so the
+      // result stays inside the range normalizeGroups() accepts.
+      layer.groups = Array.from({ length: count }, (_, i) =>
+        clampGroupValue(base + (i < rem ? 1 : 0))
+      );
       layer.overrides = {};
-      this.renderLayers();
+      this.refreshLayerDetail(layer);
     });
 
     // Group Starts Accent
@@ -1462,87 +2309,113 @@ class MetronomeApp {
         }
         pos += size;
       });
-      this.renderLayers();
+      this.refreshLayerDetail(layer);
     });
 
     // Clear Grouping
     card.querySelector('.btn-clear-group').addEventListener('click', () => {
       layer.groups = [];
-      this.renderLayers();
+      this.refreshLayerDetail(layer);
     });
 
     // Add Group
     card.querySelector('.add-group-btn').addEventListener('click', () => {
+      // maxGroupEntries is a per-layer limit: normalizeGroups() receives one
+      // layer's groups array, so the UI must count the same array.
+      if (layer.groups.length >= METRONOME_LIMITS.maxGroupEntries) {
+        this.showToast(`该 Layer 的分组数量已达上限 (${METRONOME_LIMITS.maxGroupEntries})。`);
+        return;
+      }
+
       const currentSum = layer.groups.reduce((a, b) => a + b, 0);
       const remaining = Math.max(1, layer.numerator - currentSum);
-      layer.groups.push(remaining > 0 ? remaining : 2);
-      this.renderLayers();
+      layer.groups.push(clampGroupValue(remaining > 0 ? remaining : 2));
+      this.refreshLayerDetail(layer);
     });
 
-    // Group items: values, delete, re-order
-    card.querySelectorAll('.group-tag').forEach((tagEl) => {
-      const gIdx = parseInt(tagEl.dataset.gidx, 10);
+    // Group tag interactions are delegated to the two stable containers, so a
+    // 1024-group layer costs 1 listener instead of ~4000. The index is read
+    // from the DOM at click time, which keeps it correct after edits.
+    const tagsContainer = card.querySelector('.groups-tags-container');
+    if (tagsContainer && !tagsContainer.dataset.bound) {
+      tagsContainer.dataset.bound = '1';
 
-      // Value change
-      const valInput = tagEl.querySelector('.group-tag-val');
-      valInput.addEventListener('change', (e) => {
-        const val = Math.max(1, parseInt(e.target.value, 10) || 1);
+      tagsContainer.addEventListener('change', (e) => {
+        const input = e.target.closest('.group-tag-val');
+        if (!input) return;
+        const tag = input.closest('.group-tag');
+        if (!tag) return;
+        const gIdx = parseInt(tag.dataset.gidx, 10);
+        if (!Number.isInteger(gIdx)) return;
+
+        const val = clampGroupValue(input.value);
         layer.groups[gIdx] = val;
-        this.renderLayers();
+        input.value = val;
+
+        // Only the derived summary changes; the group list itself is correct
+        // in place, so the tags are NOT rebuilt here.
+        this.refreshLayerSummary(layer);
+        this.refreshSubdivisionTypes(layer);
       });
 
-      // Delete
-      tagEl.querySelector('.group-tag-del').addEventListener('click', () => {
-        layer.groups.splice(gIdx, 1);
-        this.renderLayers();
+      tagsContainer.addEventListener('click', (e) => {
+        const btn = e.target.closest('button');
+        if (!btn) return;
+        const tag = btn.closest('.group-tag');
+        const gIdx = tag ? parseInt(tag.dataset.gidx, 10) : -1;
+
+        if (btn.classList.contains('group-tag-del')) {
+          if (!Number.isInteger(gIdx)) return;
+          layer.groups.splice(gIdx, 1);
+          this.refreshLayerDetail(layer);
+          return;
+        }
+
+        if (btn.classList.contains('group-move-left')) {
+          if (!Number.isInteger(gIdx) || gIdx <= 0) return;
+          const temp = layer.groups[gIdx];
+          layer.groups[gIdx] = layer.groups[gIdx - 1];
+          layer.groups[gIdx - 1] = temp;
+          this.refreshLayerDetail(layer);
+          return;
+        }
+
+        if (btn.classList.contains('group-move-right')) {
+          if (!Number.isInteger(gIdx) || gIdx >= layer.groups.length - 1) return;
+          const temp = layer.groups[gIdx];
+          layer.groups[gIdx] = layer.groups[gIdx + 1];
+          layer.groups[gIdx + 1] = temp;
+          this.refreshLayerDetail(layer);
+        }
       });
+    }
 
-      // Move Left
-      const leftBtn = tagEl.querySelector('.group-move-left');
-      if (leftBtn) {
-        leftBtn.addEventListener('click', () => {
-          if (gIdx > 0) {
-            const temp = layer.groups[gIdx];
-            layer.groups[gIdx] = layer.groups[gIdx - 1];
-            layer.groups[gIdx - 1] = temp;
-            this.renderLayers();
-          }
-        });
-      }
-
-      // Move Right
-      const rightBtn = tagEl.querySelector('.group-move-right');
-      if (rightBtn) {
-        rightBtn.addEventListener('click', () => {
-          if (gIdx < layer.groups.length - 1) {
-            const temp = layer.groups[gIdx];
-            layer.groups[gIdx] = layer.groups[gIdx + 1];
-            layer.groups[gIdx + 1] = temp;
-            this.renderLayers();
-          }
-        });
-      }
-    });
-
-    // --- Subdivision Interactive Cell Click ---
-    card.querySelectorAll('.subdiv-cell').forEach((cell) => {
-      cell.addEventListener('click', () => {
+    // --- Subdivision Interactive Cell Click (delegated) ---
+    const grid = card.querySelector('.subdivision-grid');
+    if (grid && !grid.dataset.bound) {
+      grid.dataset.bound = '1';
+      grid.addEventListener('click', (e) => {
+        const cell = e.target.closest('.subdiv-cell');
+        if (!cell) return;
         const index = parseInt(cell.dataset.index, 10);
+        if (!Number.isInteger(index)) return;
+
         const currentType = this.state.getBeatType(layer, index);
         const nextType = this.state.cycleBeatType(currentType);
         layer.overrides[index] = nextType;
 
-        // Immediate visual update of cell
+        // Immediate visual update of the single cell that changed.
         cell.className = `subdiv-cell ${nextType}`;
-        cell.querySelector('.cell-icon').textContent = nextType === 'accent' ? '●' : (nextType === 'mute' ? '×' : '○');
+        const icon = cell.querySelector('.cell-icon');
+        if (icon) icon.textContent = nextType === 'accent' ? '●' : (nextType === 'mute' ? '×' : '○');
         cell.title = `第 ${index + 1} 拍：${nextType}`;
       });
-    });
+    }
 
     // Pattern buttons
     card.querySelector('.btn-reset-pattern').addEventListener('click', () => {
       layer.overrides = {};
-      this.renderLayers();
+      this.refreshLayerDetail(layer);
     });
 
     card.querySelector('.btn-all-normal').addEventListener('click', () => {
@@ -1550,7 +2423,7 @@ class MetronomeApp {
       for (let i = 0; i < layer.numerator; i++) {
         layer.overrides[i] = 'normal';
       }
-      this.renderLayers();
+      this.refreshLayerDetail(layer);
     });
 
     card.querySelector('.btn-random-pattern').addEventListener('click', () => {
@@ -1559,8 +2432,40 @@ class MetronomeApp {
       for (let i = 0; i < layer.numerator; i++) {
         layer.overrides[i] = choices[Math.floor(Math.random() * choices.length)];
       }
-      this.renderLayers();
+      this.refreshLayerDetail(layer);
     });
+  }
+
+  // Repaint only the beat-type classes of the cells that are currently
+  // mounted, without rebuilding any DOM. Used after a grouping edit changes
+  // the derived accent pattern.
+  //
+  // With virtualisation the mounted cells are a contiguous slice that does not
+  // start at 0, so the index must come from data-index — never from the loop
+  // counter, which would paint the wrong beats.
+  refreshSubdivisionTypes(layer) {
+    const card = document.getElementById(layer.id);
+    if (!card) return;
+    const grid = card.querySelector('.subdivision-grid');
+    if (!grid) return;
+
+    const starts = this.groupStartSet(layer);
+    const cells = grid.querySelectorAll('.subdiv-cell');
+    for (const cell of cells) {
+      const index = parseInt(cell.dataset.index, 10);
+      if (!Number.isInteger(index) || index < 0 || index >= layer.numerator) continue;
+
+      const type = this.state.getBeatType(layer, index);
+      const wasPlayhead = cell.classList.contains('active-playhead');
+      cell.className = `subdiv-cell ${type}${wasPlayhead ? ' active-playhead' : ''}`;
+      const icon = cell.querySelector('.cell-icon');
+      if (icon) icon.textContent = type === 'accent' ? '●' : (type === 'mute' ? '×' : '○');
+      cell.title = `第 ${index + 1} 拍：${type}`;
+      const wrapEl = cell.parentElement;
+      if (wrapEl && wrapEl.classList) {
+        wrapEl.classList.toggle('group-start', starts.has(index) && index > 0);
+      }
+    }
   }
 
   // ==========================================================================
@@ -1655,9 +2560,8 @@ class MetronomeApp {
   }
 
   saveUserPreset(name) {
-    const presets = this.getUserPresets();
     const newPreset = {
-      name,
+      name: normalizeName(name, `Preset ${new Date().toLocaleTimeString()}`),
       bpm: this.state.bpm,
       layers: this.state.layers.map((l) => ({
         name: l.name,
@@ -1674,10 +2578,21 @@ class MetronomeApp {
       timestamp: Date.now(),
     };
 
+    // Never persist a preset the loader would refuse. This is the same
+    // validator loadPresetData() uses, so save and load cannot disagree.
+    const check = this.state.normalizeConfiguration(newPreset);
+    if (!check.ok) {
+      console.warn('Refusing to save invalid preset:', check.reason);
+      this.showToast('当前配置无法保存为预设，已保持原有预设不变。');
+      return false;
+    }
+
+    const presets = this.getUserPresets();
     presets.unshift(newPreset);
     this.saveUserPresetsToStorage(presets);
     this.renderUserPresets();
-    this.showToast(`预设「${name}」已保存到本地！`);
+    this.showToast(`预设「${newPreset.name}」已保存到本地！`);
+    return true;
   }
 
   loadPresetData(preset) {
@@ -1705,10 +2620,13 @@ class MetronomeApp {
   }
 
   // Single place that swaps the live configuration and resets transport state.
+  // Expansion state is UI-only, so it is recomputed for the new configuration;
+  // the beat data itself is never touched by render state.
   applyConfiguration({ bpm, layers }) {
     this.state.bpm = bpm;
     this.state.layers = layers;
     this.state.clearVisualQueue();
+    this.applyInitialExpansionState();
     this.renderAll();
   }
 
@@ -1736,6 +2654,21 @@ class MetronomeApp {
     try {
       const jsonStr = JSON.stringify(config);
       const encoded = btoa(encodeURIComponent(jsonStr));
+
+      // Same measurement as the import path (loadStateFromUrl compares
+      // hash.length). Checked before touching the clipboard or the URL, so an
+      // oversized config can never produce a link this app would refuse.
+      //
+      // A configuration being too large to share does NOT make it invalid: it
+      // is still a legal local configuration and can be saved as a preset.
+      // The message says so explicitly, so the two conditions are not confused.
+      if (!isPayloadWithinLimit(encoded)) {
+        this.showToast(
+          `配置过大（${encoded.length} 字符，上限 ${METRONOME_LIMITS.maxPayloadLength}），无法生成分享链接；该配置仍然有效，可保存为本地预设。`
+        );
+        return false;
+      }
+
       const url = new URL(window.location.href);
       url.hash = encoded;
 
@@ -1745,8 +2678,11 @@ class MetronomeApp {
         window.location.hash = encoded;
         this.showToast('已更新 URL Hash，可直接复制地址栏分享！');
       });
+      return true;
     } catch (e) {
       console.error('URL encode failed', e);
+      this.showToast('生成分享链接失败，请检查当前配置。');
+      return false;
     }
   }
 
@@ -1783,8 +2719,9 @@ class MetronomeApp {
     if (!hash) return false;
 
     // Bound the work before decoding: a huge or malformed hash must not be
-    // able to stall or crash initialization.
-    if (hash.length > METRONOME_LIMITS.maxPayloadLength) {
+    // able to stall or crash initialization. Shares the exact same predicate
+    // as shareConfiguration().
+    if (!isPayloadWithinLimit(hash)) {
       console.warn('Ignoring URL config: payload too large.');
       return false;
     }

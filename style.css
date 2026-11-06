@@ -561,6 +561,41 @@ button, .subdiv-cell, .tap-btn, .step-btn {
   gap: 6px;
 }
 
+/* Collapsed layer: header stays, detail DOM is absent entirely. */
+.layer-card.collapsed .layer-main {
+  padding-bottom: 12px;
+}
+
+.layer-card.collapsed .layer-header-bar {
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+.layer-summary {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-weight: 700;
+  margin-left: 4px;
+  white-space: nowrap;
+}
+
+.expand-btn {
+  background: var(--bg-input);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 5px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.expand-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--accent-cyan);
+}
+
 .mute-btn {
   background: var(--bg-input);
   border: 1px solid var(--border-subtle);
@@ -651,10 +686,42 @@ button, .subdiv-cell, .tap-btn, .step-btn {
 
 .groups-tags-container {
   display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 36px;
+}
+
+/* Virtualised group tags: spacers reserve the height of unmounted rows so the
+   page scroll geometry stays identical to a fully rendered list. */
+.groups-tags-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.groups-tags-mounted {
+  display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  min-height: 36px;
+}
+
+.virtual-spacer {
+  width: 100%;
+  flex: 0 0 auto;
+  pointer-events: none;
+}
+
+.virtual-spacer-h {
+  height: 1px;
+  flex: 0 0 auto;
+  pointer-events: none;
+}
+
+.subdiv-cells-mounted {
+  display: flex;
+  align-items: flex-start;
+  gap: 2px;
 }
 
 .group-tag {
