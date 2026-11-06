@@ -16,7 +16,8 @@
   "scripts": {
     "start": "electron .",
     "serve": "npx serve -l 3000 .",
-    "build:win": "electron-packager . \"Polyrhythmic Metronome\" --platform=win32 --arch=x64 --out=release --overwrite --ignore=\"^/android($|/)\" --ignore=\"^/apk($|/)\" --ignore=\"^/www($|/)\" --ignore=\"^/release($|/)\" --ignore=\"^/scripts($|/)\" --ignore=\"\\.keystore$\"",
+    "test": "node --test tests/*.test.js",
+    "build:win": "electron-packager . \"Polyrhythmic Metronome\" --platform=win32 --arch=x64 --out=release --overwrite --ignore=\"^/android($|/)\" --ignore=\"^/apk($|/)\" --ignore=\"^/www($|/)\" --ignore=\"^/release($|/)\" --ignore=\"^/scripts($|/)\" --ignore=\"^/tests($|/)\" --ignore=\"\\.keystore$\"",
     "prepare:cap": "node scripts/prepare-cap.js",
     "cap:sync": "npm run prepare:cap && cap sync android",
     "cap:open": "cap open android",

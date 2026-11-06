@@ -5,6 +5,329 @@
  */
 
 // ============================================================================
+// 0. Shared Configuration Constraints
+// ============================================================================
+// Single source of truth for every value that can arrive from the UI, a
+// shared URL hash or a saved preset. Both import paths run through
+// MetronomeState.normalizeConfiguration(), so neither can bypass these limits.
+
+const METRONOME_LIMITS = Object.freeze({
+  bpm: { min: 20, max: 600 },
+  numerator: { min: 1, max: 1024 },
+  denominator: { min: 1, max: 256 },
+  bpmMultiplier: { min: 0.1, max: 8 },
+  volume: { min: 0, max: 1 },
+  accentVolume: { min: 0.5, max: 2 },
+  groupSize: { min: 1, max: 512 },
+  maxLayers: 64,
+  maxGroupEntries: 1024,
+  maxOverrides: 1024,
+  maxNameLength: 200,
+  maxPayloadLength: 200000,
+});
+
+const METRONOME_SOUNDS = ['classic', 'wood', 'electronic', 'soft', 'cowbell'];
+const METRONOME_BEAT_TYPES = ['accent', 'normal', 'mute'];
+
+// Rendering thresholds for the layer list. Kept in one place so the collapse
+// policy is not re-derived in individual handlers.
+//
+// A layer's "detail" (grouping tags + subdivision grid) is what costs DOM:
+// a full 1024-subdivision card is ~9.3k nodes. Above these thresholds the
+// list starts collapsed and detail is built only when a layer is expanded.
+const LAYER_RENDER_POLICY = Object.freeze({
+  // Collapse detail by default when the configuration is at least this big.
+  autoCollapseLayerCount: 8,
+  autoCollapseTotalSubdivisions: 4000,
+  // A layer whose own subdivision count exceeds this also starts collapsed,
+  // even when the whole configuration is small (e.g. a single 59/16 layer is
+  // fine, but a single 1024-subdivision layer is not).
+  autoCollapseLayerSubdivisions: 512,
+});
+
+// Virtualisation budget for the per-layer detail. Detail content (group tags
+// and pattern cells) is mounted only for the slice near the viewport, so DOM
+// stays bounded no matter how many layers are expanded or how big they are.
+//
+// Measured sizes used to place spacers without measuring the DOM on every
+// scroll. They are intentionally the design constants from style.css; a real
+// measurement overrides them per layer on first render.
+const VIRTUAL_POLICY = Object.freeze({
+  // --- pattern cells: units are CELLS -------------------------------------
+  // Extra cells mounted before/after the visible slice.
+  overscanItems: 6,
+  // Minimum cells to mount when the viewport size is not yet known.
+  minWindowItems: 24,
+
+  // --- group tags: units are ROWS -----------------------------------------
+  // Tags wrap, so the layout unit is a row. Keeping these separate from the
+  // cell settings avoids mixing "items" with "rows", which would mount hundreds
+  // of tags to satisfy a per-item minimum.
+  overscanRows: 2,
+  minGroupRows: 3,
+
+  // --- shared -------------------------------------------------------------
+  // Below this many ITEMS (groups or cells) a collection mounts in full and
+  // skips virtualisation entirely. For groups this is a group count, never a
+  // row count.
+  fullRenderThreshold: 120,
+  // Fallback geometry, used until a layer's real size is measured.
+  fallbackTagWidth: 92,   // .group-tag incl. gap
+  fallbackTagHeight: 30,  // .group-tag height incl. row gap
+  fallbackCellWidth: 34,  // .subdiv-cell-wrap incl. gap
+  fallbackCellHeight: 60, // .subdiv-cell-wrap full height
+  // Flexbox packing rule for .groups-tags-mounted. The LAST tag in a row has
+  // no trailing gap, so `floor(availWidth / itemWidth)` underestimates
+  // capacity by one at exact boundaries. These are the ONLY place the CSS
+  // constants are declared; getGroupGeometry() derives everything from them.
+  groupTagGap: 8,
+  groupTagWidth: 106,
+  // Deceleration window for scroll events: one rAF batch per frame.
+  scrollSettleMs: 16,
+});
+
+// Accept JSON numbers and numeric strings; reject NaN, Infinity and junk.
+function toFiniteNumber(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+// Numeric but out of range is clamped, exactly like the UI inputs do.
+// Non-numeric / non-finite values fall back instead of reaching the scheduler.
+function clampNumber(value, range, fallback) {
+  const n = toFiniteNumber(value);
+  if (n === null) return fallback;
+  return Math.min(range.max, Math.max(range.min, n));
+}
+
+function clampInt(value, range, fallback) {
+  const n = toFiniteNumber(value);
+  if (n === null) return fallback;
+  return Math.min(range.max, Math.max(range.min, Math.round(n)));
+}
+
+function normalizeName(value, fallback) {
+  if (typeof value !== 'string') return fallback;
+  const trimmed = value.trim().slice(0, METRONOME_LIMITS.maxNameLength);
+  return trimmed || fallback;
+}
+
+// One group size, clamped to exactly the range normalizeGroups() accepts.
+// The UI uses this so it cannot produce a grouping that import would reject.
+function clampGroupValue(value) {
+  return clampInt(value, METRONOME_LIMITS.groupSize, METRONOME_LIMITS.groupSize.min);
+}
+
+// The import path compares the length of the encoded fragment it reads back
+// from location.hash. Export must measure the same string, otherwise a link
+// could be generated that this app refuses to load.
+function isPayloadWithinLimit(encodedHash) {
+  return typeof encodedHash === 'string' && encodedHash.length <= METRONOME_LIMITS.maxPayloadLength;
+}
+
+// ============================================================================
+// Virtualisation window maths (pure functions, no DOM)
+// ============================================================================
+//
+// Both the group-tag list and the pattern grid mount only a slice of their
+// items. These helpers turn "how much of the list is on screen" into an
+// [start, end) index range plus the spacer sizes that keep the scroll geometry
+// identical to a fully-rendered list.
+
+// Number of items in the viewport, given the item size along the scroll axis.
+function itemsPerViewport(viewportSize, itemSize) {
+  const size = toFiniteNumber(itemSize);
+  if (size === null || size <= 0) return 0;
+  const view = toFiniteNumber(viewportSize);
+  if (view === null || view <= 0) return 0;
+  return view / size;
+}
+
+/**
+ * Compute the mounted slice for a one-dimensional virtual list.
+ *
+ * `scrollOffset` is how far the list's own scroll position has advanced along
+ * its axis (0 when the list is laid out in normal page flow and only the page
+ * scrolls — see computeVisibleRange for that case).
+ *
+ * Returns { start, end, before, after } where [start, end) are the item indexes
+ * to mount and `before`/`after` are the spacer sizes before and after them, in
+ * items (multiply by the item size for pixels). `end` may equal `start` when
+ * there is nothing to mount, never less.
+ */
+function computeWindow({ total, viewportSize, itemSize, scrollOffset = 0, overscan = 0, minItems = 0 }) {
+  const count = toFiniteNumber(total);
+  if (count === null || count <= 0) {
+    return { start: 0, end: 0, before: 0, after: 0 };
+  }
+  const totalItems = Math.floor(count);
+  const size = toFiniteNumber(itemSize);
+  const view = toFiniteNumber(viewportSize);
+  const offset = Number.isFinite(toFiniteNumber(scrollOffset)) ? toFiniteNumber(scrollOffset) : 0;
+
+  // Degenerate geometry: mount everything rather than produce an empty window.
+  if (size === null || size <= 0 || view === null || view <= 0) {
+    return { start: 0, end: totalItems, before: 0, after: 0 };
+  }
+
+  const visibleCount = Math.max(1, Math.ceil(view / size) + 1);
+  const firstVisible = Math.floor(Math.max(0, offset) / size);
+
+  let start = firstVisible - overscan;
+  let end = firstVisible + visibleCount + overscan;
+
+  if (minItems > 0) {
+    const shortfall = minItems - (end - start);
+    if (shortfall > 0) {
+      end += shortfall;
+    }
+  }
+
+  start = Math.max(0, start);
+  end = Math.min(totalItems, end);
+  if (end < start) end = start;
+
+  return {
+    start,
+    end,
+    before: start,
+    after: totalItems - end,
+  };
+}
+
+/**
+ * Window for a list laid out in normal document flow (no inner scroller).
+ *
+ * `elementTop`/`elementHeight` describe the list's box in viewport
+ * coordinates; only the part that intersects [0, viewportHeight] is visible.
+ * Horizontal lists additionally use their own scrollLeft, since the pattern
+ * grid scrolls sideways inside the card.
+ */
+function computeVisibleRange({
+  total,
+  viewportStart,      // px, list coordinate == 0 at first item
+  viewportEnd,        // px
+  itemSize,
+  overscan = 0,
+  minItems = 0,
+  maxMount,           // hard cap on mounted items, 0/undefined = no cap
+}) {
+  const count = toFiniteNumber(total);
+  if (count === null || count <= 0) {
+    return { start: 0, end: 0, before: 0, after: 0 };
+  }
+  const totalItems = Math.floor(count);
+  const size = toFiniteNumber(itemSize);
+
+  if (size === null || size <= 0) {
+    return { start: 0, end: totalItems, before: 0, after: 0 };
+  }
+
+  const vStart = toFiniteNumber(viewportStart);
+  const vEnd = toFiniteNumber(viewportEnd);
+
+  // Unknown geometry: mount a conservative opening window, not everything.
+  if (vStart === null || vEnd === null) {
+    let start = 0;
+    let end = Math.max(1, minItems, 1);
+    end = Math.min(totalItems, end);
+    return { start, end, before: start, after: totalItems - end };
+  }
+
+  const firstVisible = Math.floor(Math.max(0, vStart) / size);
+  const visibleCount = Math.max(1, Math.ceil(Math.max(0, vEnd - vStart) / size) + 1);
+
+  let start = firstVisible - overscan;
+  let end = firstVisible + visibleCount + overscan;
+
+  if (minItems > 0) {
+    const shortfall = minItems - (end - start);
+    if (shortfall > 0) end += shortfall;
+  }
+
+  start = Math.max(0, start);
+  end = Math.min(totalItems, end);
+
+  if (maxMount && maxMount > 0 && end - start > maxMount) {
+    end = start + maxMount;
+  }
+
+  if (end < start) end = start;
+
+  return {
+    start,
+    end,
+    before: start,
+    after: totalItems - end,
+  };
+}
+
+// Effective window: small lists skip virtualisation entirely.
+function computeEffectiveWindow(total, window, threshold = VIRTUAL_POLICY.fullRenderThreshold) {
+  const count = Number.isFinite(total) ? Math.max(0, Math.floor(total)) : 0;
+  if (count <= threshold) {
+    return { start: 0, end: count, before: 0, after: 0, virtualized: false };
+  }
+  return { ...window, virtualized: true };
+}
+
+// Grouping is validated structurally only. Its SUM is deliberately NOT
+// validated here: the UI allows temporarily incomplete groupings (Clear
+// Grouping) and reports the mismatch as a warning, so that stays editable.
+// Returns a fresh array, or null when the structure itself is unusable.
+function normalizeGroups(raw, fallbackGroups) {
+  if (raw === undefined || raw === null) {
+    return Array.isArray(fallbackGroups) ? [...fallbackGroups] : null;
+  }
+  if (!Array.isArray(raw) || raw.length > METRONOME_LIMITS.maxGroupEntries) return null;
+
+  const groups = [];
+  for (const entry of raw) {
+    const n = toFiniteNumber(entry);
+    if (n === null || !Number.isInteger(n)) return null;
+    if (n < METRONOME_LIMITS.groupSize.min || n > METRONOME_LIMITS.groupSize.max) return null;
+    groups.push(n);
+  }
+  return groups;
+}
+
+// Overrides: { [subdivIndex]: 'accent'|'normal'|'mute' } or [[index, type], ...].
+// Entries whose index is outside this layer's subdivision range, or whose beat
+// type is unknown, are dropped — an override is optional, so dropping it falls
+// back to the grouping-derived default rather than corrupting the pattern.
+// Returns a fresh object, or null when the container structure is unusable.
+function normalizeOverrides(raw, numerator) {
+  if (raw === undefined || raw === null) return {};
+
+  let entries;
+  if (Array.isArray(raw)) {
+    if (raw.length > METRONOME_LIMITS.maxOverrides) return null;
+    entries = raw;
+  } else if (typeof raw === 'object') {
+    entries = Object.entries(raw);
+    if (entries.length > METRONOME_LIMITS.maxOverrides) return null;
+  } else {
+    return null;
+  }
+
+  const overrides = {};
+  for (const entry of entries) {
+    if (!Array.isArray(entry) || entry.length < 2) continue;
+    const index = toFiniteNumber(entry[0]);
+    const type = entry[1];
+    if (index === null || !Number.isInteger(index)) continue;
+    if (index < 0 || index >= numerator) continue;
+    if (!METRONOME_BEAT_TYPES.includes(type)) continue;
+    overrides[index] = type;
+  }
+  return overrides;
+}
+
+// ============================================================================
 // 1. Audio Engine & Sound Synthesizer (Look-Ahead Scheduling)
 // ============================================================================
 
@@ -18,8 +341,17 @@ class MetronomeAudioEngine {
     this.scheduleInterval = 25; // How often scheduler runs (ms)
     this.timerId = null;
 
+    // Voices already handed to Web Audio and not finished yet. The transport
+    // uses this to cancel the look-ahead window on pause / stop / reset —
+    // clearing the scheduler interval alone leaves scheduled nodes alive.
+    this.activeVoices = new Set();
+
     // Callbacks
     this.onBeatScheduled = null; // Called when a beat is scheduled
+
+    // Voice currently being built by playClick(); synths register their
+    // sources here so the transport can cancel them on pause/stop/reset.
+    this._currentVoice = null;
 
     // Sound Synthesizers
     this.soundEngines = {
@@ -51,9 +383,18 @@ class MetronomeAudioEngine {
 
   // --- Sound Synthesizers (Web Audio Synthesis, 0 external assets) ---
 
+  // Register a source node with the voice currently being built by playClick().
+  // Returns the node unchanged so synths can stay one-liners.
+  trackVoiceNode(node) {
+    if (this._currentVoice) {
+      this._currentVoice.nodes.push(node);
+    }
+    return node;
+  }
+
   synthClassic(time, isAccent, destination) {
     const ctx = this.audioCtx;
-    const osc = ctx.createOscillator();
+    const osc = this.trackVoiceNode(ctx.createOscillator());
     const env = ctx.createGain();
 
     const startFreq = isAccent ? 2200 : 1300;
@@ -78,7 +419,7 @@ class MetronomeAudioEngine {
     const ctx = this.audioCtx;
 
     // Tuned body
-    const osc = ctx.createOscillator();
+    const osc = this.trackVoiceNode(ctx.createOscillator());
     const oscEnv = ctx.createGain();
     const freq = isAccent ? 980 : 720;
     osc.type = 'sine';
@@ -100,7 +441,7 @@ class MetronomeAudioEngine {
       output[i] = Math.random() * 2 - 1;
     }
 
-    const noise = ctx.createBufferSource();
+    const noise = this.trackVoiceNode(ctx.createBufferSource());
     noise.buffer = noiseBuffer;
 
     const filter = ctx.createBiquadFilter();
@@ -122,7 +463,7 @@ class MetronomeAudioEngine {
 
   synthElectronic(time, isAccent, destination) {
     const ctx = this.audioCtx;
-    const osc = ctx.createOscillator();
+    const osc = this.trackVoiceNode(ctx.createOscillator());
     const env = ctx.createGain();
 
     osc.type = 'square';
@@ -145,7 +486,7 @@ class MetronomeAudioEngine {
 
   synthSoft(time, isAccent, destination) {
     const ctx = this.audioCtx;
-    const osc = ctx.createOscillator();
+    const osc = this.trackVoiceNode(ctx.createOscillator());
     const env = ctx.createGain();
 
     osc.type = 'sine';
@@ -171,7 +512,7 @@ class MetronomeAudioEngine {
     const f2 = isAccent ? 890 : 800;
 
     [f1, f2].forEach((freq) => {
-      const osc = ctx.createOscillator();
+      const osc = this.trackVoiceNode(ctx.createOscillator());
       const env = ctx.createGain();
 
       osc.type = 'square';
@@ -195,19 +536,83 @@ class MetronomeAudioEngine {
   }
 
   // Play click using selected sound
-  playClick(time, beatType, soundType, volume, accentVolume) {
+  playClick(time, beatType, soundType, volume, accentVolume, layerId) {
     if (beatType === 'mute') return;
 
     const ctx = this.ensureContext();
     const isAccent = beatType === 'accent';
     const finalVolume = isAccent ? volume * accentVolume : volume;
 
+    // Defensive: a non-finite volume or time would poison the whole voice.
+    if (!Number.isFinite(time) || !Number.isFinite(finalVolume)) return;
+
     const gainNode = ctx.createGain();
     gainNode.gain.setValueAtTime(Math.min(1.0, Math.max(0, finalVolume)), time);
     gainNode.connect(this.masterGain);
 
-    const synthFn = this.soundEngines[soundType] || this.soundEngines.classic;
-    synthFn(time, isAccent, gainNode);
+    // Longest synth tail (cowbell, 0.28s) plus margin: a voice is finished
+    // once AudioContext time passes this, so it can be pruned.
+    const voice = { nodes: [], gainNode, endTime: time + 0.35, layerId };
+    this._currentVoice = voice;
+    try {
+      const synthFn = this.soundEngines[soundType] || this.soundEngines.classic;
+      synthFn(time, isAccent, gainNode);
+    } finally {
+      this._currentVoice = null;
+    }
+
+    if (voice.nodes.length > 0) {
+      this.pruneFinishedVoices();
+      this.activeVoices.add(voice);
+    }
+  }
+
+  // Drop voices whose last node has already finished playing.
+  pruneFinishedVoices() {
+    if (this.activeVoices.size === 0) return;
+    const now = this.currentTime;
+    this.activeVoices.forEach((voice) => {
+      if (voice.endTime <= now) this.activeVoices.delete(voice);
+    });
+  }
+
+  // Silence everything already handed to Web Audio (the look-ahead window).
+  // Clearing the scheduler interval alone leaves those nodes scheduled, so a
+  // pause would still produce a short click tail. This does not touch the
+  // AudioContext clock, so timing model and browser/Electron behaviour are
+  // unchanged — only the pending voices are cancelled.
+  // Pass a layerId to cancel just that layer's pending voices.
+  cancelScheduledVoices(layerId) {
+    if (!this.audioCtx || this.activeVoices.size === 0) {
+      this.activeVoices.clear();
+      return;
+    }
+
+    const now = this.currentTime;
+    const cancelled = new Set();
+    this.activeVoices.forEach((voice) => {
+      if (layerId !== undefined && voice.layerId !== layerId) return;
+      cancelled.add(voice);
+
+      try {
+        // Zero the per-click gain first: a cancelled exponential ramp would
+        // otherwise be re-evaluated from the old curve.
+        voice.gainNode.gain.cancelScheduledValues(now);
+        voice.gainNode.gain.setValueAtTime(0, now);
+      } catch (e) {
+        console.warn('Failed to silence scheduled voice gain:', e);
+      }
+
+      voice.nodes.forEach((node) => {
+        try {
+          node.stop(now);
+        } catch (e) {
+          // Already stopped / never started: nothing left to cancel.
+        }
+      });
+    });
+
+    cancelled.forEach((voice) => this.activeVoices.delete(voice));
   }
 }
 
@@ -224,7 +629,53 @@ class MetronomeState {
     this.activePresetId = null;
 
     // Visual queue for synchronization
-    this.visualQueue = []; // array of { layerId, subdivIndex, audioTime }
+    this.visualQueue = []; // array of { layerId, subdivIndex, audioTime }, sorted by audioTime
+
+    // Monotonic tie-breaker so events with identical audioTime keep their
+    // insertion order and sorting stays stable across engines.
+    this.visualSeq = 0;
+  }
+
+  // Insert a visual event so the queue is always ordered globally by
+  // audioTime — not grouped by layer. Binary search over the tail because new
+  // events are normally the latest ones; equal timestamps keep FIFO order.
+  enqueueVisualEvent(layerId, subdivIndex, audioTime) {
+    if (!Number.isFinite(audioTime)) return;
+
+    const queue = this.visualQueue;
+    const event = { layerId, subdivIndex, audioTime, seq: this.visualSeq++ };
+
+    let low = 0;
+    let high = queue.length;
+    while (low < high) {
+      const mid = (low + high) >> 1;
+      const midEvent = queue[mid];
+      if (
+        midEvent.audioTime < audioTime ||
+        (midEvent.audioTime === audioTime && midEvent.seq <= event.seq)
+      ) {
+        low = mid + 1;
+      } else {
+        high = mid;
+      }
+    }
+    queue.splice(low, 0, event);
+  }
+
+  // Remove and return every event whose audio time has arrived, earliest first.
+  takeDueVisualEvents(now) {
+    const queue = this.visualQueue;
+    let count = 0;
+    while (count < queue.length && queue[count].audioTime <= now) {
+      count++;
+    }
+    if (count === 0) return [];
+    return queue.splice(0, count);
+  }
+
+  clearVisualQueue() {
+    this.visualQueue.length = 0;
+    this.visualSeq = 0;
   }
 
   // Calculate subdivision interval in seconds:
@@ -232,9 +683,11 @@ class MetronomeState {
   // Sixteenth (den=16): 60 / BPM / (16/4) = 60 / BPM / 4
   // Generic: (4 / denominator) * (60 / (BPM * multiplier))
   getSubdivDuration(layer) {
-    const num = Math.max(1, layer.numerator);
-    const den = Math.max(1, layer.denominator);
-    const effectiveBpm = Math.max(10, this.bpm * layer.bpmMultiplier);
+    const num = Math.max(1, toFiniteNumber(layer.numerator) ?? 1);
+    const den = Math.max(1, toFiniteNumber(layer.denominator) ?? 1);
+    const bpm = toFiniteNumber(this.bpm) ?? 140;
+    const multiplier = toFiniteNumber(layer.bpmMultiplier) ?? 1;
+    const effectiveBpm = Math.max(10, bpm * multiplier);
     return (4 / den) * (60 / effectiveBpm);
   }
 
@@ -255,31 +708,123 @@ class MetronomeState {
     return groups;
   }
 
-  // Create a new layer with default settings
-  createLayer(config = {}) {
-    const id = 'layer_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
-    const numerator = config.numerator !== undefined ? Math.max(1, parseInt(config.numerator, 10)) : 59;
-    const denominator = config.denominator !== undefined ? Math.max(1, parseInt(config.denominator, 10)) : 16;
-    const groups = config.groups ? [...config.groups] : this.autoGroup(numerator);
+  // Validate and normalize a whole configuration document — the shared path
+  // for URL hashes and saved presets, so neither can bypass the constraints.
+  // Returns { ok: true, bpm, layers } or { ok: false, reason }.
+  // Structural problems reject the document; numeric problems are clamped or
+  // replaced by defaults, matching what the UI itself allows.
+  normalizeConfiguration(raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, reason: 'configuration is not an object' };
+    }
+    if (!Array.isArray(raw.layers)) {
+      return { ok: false, reason: 'configuration has no layer array' };
+    }
+    if (raw.layers.length === 0) {
+      return { ok: false, reason: 'configuration has no layers' };
+    }
+    if (raw.layers.length > METRONOME_LIMITS.maxLayers) {
+      return { ok: false, reason: `configuration exceeds ${METRONOME_LIMITS.maxLayers} layers` };
+    }
+
+    const layers = [];
+    for (let idx = 0; idx < raw.layers.length; idx++) {
+      const rawLayer = raw.layers[idx];
+      if (rawLayer === null || typeof rawLayer !== 'object' || Array.isArray(rawLayer)) {
+        return { ok: false, reason: `layer ${idx + 1} is not an object` };
+      }
+
+      const numerator = clampInt(rawLayer.numerator, METRONOME_LIMITS.numerator, null);
+      if (numerator === null) {
+        return { ok: false, reason: `layer ${idx + 1} has an invalid numerator` };
+      }
+
+      // Grouping structure is checked, but its sum is not: incomplete groupings
+      // are a supported editing state.
+      const groups = normalizeGroups(rawLayer.groups, this.autoGroup(numerator));
+      if (groups === null) {
+        return { ok: false, reason: `layer ${idx + 1} has an invalid grouping` };
+      }
+
+      const overrides = normalizeOverrides(rawLayer.overrides, numerator);
+      if (overrides === null) {
+        return { ok: false, reason: `layer ${idx + 1} has invalid overrides` };
+      }
+
+      layers.push(this.createLayer({
+        name: rawLayer.name,
+        numerator,
+        denominator: rawLayer.denominator,
+        bpmMultiplier: rawLayer.bpmMultiplier,
+        groups,
+        overrides,
+        sound: rawLayer.sound,
+        volume: rawLayer.volume,
+        accentVolume: rawLayer.accentVolume,
+        muted: rawLayer.muted,
+        color: this.getLayerColor(idx),
+      }));
+    }
 
     return {
+      ok: true,
+      bpm: clampInt(raw.bpm, METRONOME_LIMITS.bpm, 120),
+      layers,
+    };
+  }
+
+  // Create a new layer with default settings.
+  // Every incoming value is normalized here, so callers (UI, URL hash,
+  // presets) cannot inject NaN/Infinity or out-of-range numbers into the
+  // scheduler. Structurally invalid input is rejected by
+  // normalizeConfiguration() before this is reached.
+  createLayer(config = {}) {
+    const id = 'layer_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+
+    const numerator = clampInt(config.numerator, METRONOME_LIMITS.numerator, 59);
+    const denominator = clampInt(config.denominator, METRONOME_LIMITS.denominator, 16);
+    const groups = normalizeGroups(config.groups, this.autoGroup(numerator)) || this.autoGroup(numerator);
+    const overrides = normalizeOverrides(config.overrides, numerator) || {};
+    const name = normalizeName(config.name, `Layer ${this.layers.length + 1}`);
+    const sound = METRONOME_SOUNDS.includes(config.sound) ? config.sound : 'classic';
+
+    const layer = {
       id,
-      name: config.name || `Layer ${this.layers.length + 1}`,
+      name,
       numerator,
       denominator,
-      bpmMultiplier: config.bpmMultiplier || 1.0,
+      bpmMultiplier: clampNumber(config.bpmMultiplier, METRONOME_LIMITS.bpmMultiplier, 1.0),
       groups,
-      overrides: config.overrides ? { ...config.overrides } : {}, // { [subdivIndex]: 'accent'|'normal'|'mute' }
-      sound: config.sound || 'classic',
-      volume: config.volume !== undefined ? config.volume : 0.8,
-      accentVolume: config.accentVolume !== undefined ? config.accentVolume : 1.3,
+      overrides, // { [subdivIndex]: 'accent'|'normal'|'mute' }
+      sound,
+      volume: clampNumber(config.volume, METRONOME_LIMITS.volume, 0.8),
+      accentVolume: clampNumber(config.accentVolume, METRONOME_LIMITS.accentVolume, 1.3),
       muted: !!config.muted,
 
       // Runtime scheduler state
       nextNoteTime: 0,
       currentSubdiv: 0,
-      color: config.color || this.getLayerColor(this.layers.length),
+      color: typeof config.color === 'string' && config.color ? config.color : this.getLayerColor(this.layers.length),
     };
+
+    // Parallel stable IDs for grouping entries. These are RUNTIME-ONLY: they
+    // are defined non-enumerable so JSON.stringify (share links, saved
+    // presets, localStorage) never sees them, and no config format changes.
+    // Drafts key off these IDs, so inserting / deleting / moving a group can
+    // never apply an uncommitted edit to a different group.
+    Object.defineProperty(layer, '__groupIds', {
+      value: groups.map(() => this.nextGroupId()),
+      writable: true, enumerable: false, configurable: true,
+    });
+    Object.defineProperty(layer, '__groupSeq', {
+      value: groups.length, writable: true, enumerable: false, configurable: true,
+    });
+    return layer;
+  }
+
+  nextGroupId() {
+    this.__groupIdCounter = (this.__groupIdCounter || 0) + 1;
+    return 'g' + this.__groupIdCounter;
   }
 
   getLayerColor(index) {
@@ -495,6 +1040,21 @@ class MetronomeApp {
   }
 
   init() {
+    // Expansion state must exist before any card is built.
+    this.expandedLayerIds = new Set();
+
+    // Virtualisation bookkeeping: one observer per expanded layer, plus a
+    // coalescing set so a burst of resize/scroll signals costs one remount.
+    this.virtualObservers = new Map();
+    this.virtualRefreshQueued = new Map();
+    this.pendingCellIndex = new Map();
+    this.gridCursor = new Map();
+
+    // Uncommitted Group input drafts, kept OUTSIDE the DOM so off-screen
+    // virtualisation can discard the nodes without losing what the user typed.
+    // Structure: Map<layerId, Map<stableGroupId, rawString>>.
+    this.groupDrafts = new Map();
+
     // Check URL state first, otherwise load default
     if (!this.loadStateFromUrl()) {
       // Default directly to 59/16 signature metronome
@@ -502,11 +1062,51 @@ class MetronomeApp {
     }
 
     this.bindEvents();
+    this.bindVirtualScroll();
     this.renderAll();
     this.renderPresets();
 
     // Start requestAnimationFrame visual loop
     this.startVisualLoop();
+  }
+
+  // One passive scroll listener for the whole page, one rAF batch at a time.
+  // Individual cells never get their own scroll handlers.
+  bindVirtualScroll() {
+    if (this.virtualScrollBound) return;
+    this.virtualScrollBound = true;
+
+    let pending = false;
+    const onScroll = () => {
+      if (pending) return;
+      pending = true;
+      const flush = () => {
+        pending = false;
+        this.onPageScroll();
+      };
+      if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(flush);
+      } else {
+        setTimeout(flush, VIRTUAL_POLICY.scrollSettleMs);
+      }
+    };
+
+    if (typeof window !== 'undefined' && window.addEventListener) {
+      window.addEventListener('scroll', onScroll, { passive: true });
+      window.addEventListener('resize', onScroll, { passive: true });
+    }
+
+    // The pattern grid scrolls horizontally inside its own wrapper. That must
+    // not rebuild the group tags above it, so only the cell window refreshes.
+    if (this.dom.layersList && this.dom.layersList.addEventListener) {
+      this.dom.layersList.addEventListener('scroll', (e) => {
+        const wrap = e.target && e.target.closest && e.target.closest('.subdivision-scroll-wrap');
+        if (!wrap) return;
+        const card = wrap.closest('.layer-card');
+        if (!card || !card.id) return;
+        this.scheduleVirtualRefresh(card.id, 'cells');
+      }, { passive: true, capture: true });
+    }
   }
 
   // ==========================================================================
@@ -519,19 +1119,45 @@ class MetronomeApp {
     this.state.isPaused = false;
     this.acquireWakeLock();
 
+    // Defensive: never inherit a queue from a previous transport state, and
+    // never leave a second interval running.
+    this.state.clearVisualQueue();
+    if (this.audioEngine.timerId) {
+      clearInterval(this.audioEngine.timerId);
+      this.audioEngine.timerId = null;
+    }
+
     const startTime = ctx.currentTime + 0.05;
 
-    // Reset nextNoteTime for all layers
+    // Re-anchor the audio timeline. currentSubdiv is preserved, so playback
+    // resumes at the same musical position (pause never rewinds the position).
     this.state.layers.forEach((layer) => {
       layer.nextNoteTime = startTime;
     });
 
-    if (this.audioEngine.timerId) {
-      clearInterval(this.audioEngine.timerId);
-    }
-
     this.audioEngine.timerId = setInterval(() => this.scheduler(), this.audioEngine.scheduleInterval);
     this.updateTransportUI();
+  }
+
+  // Before dropping the queue, rewind each layer to the earliest subdivision
+  // that was scheduled into the look-ahead window but had not become audible
+  // yet. Resume restarts exactly there: nothing from the cancelled window is
+  // lost, and nothing already heard is replayed. Events whose audioTime has
+  // already passed were audible and must not be rewound.
+  capturePendingPositions() {
+    const now = this.audioEngine.audioCtx ? this.audioEngine.currentTime : 0;
+    const pending = new Map();
+    this.state.visualQueue.forEach((event) => {
+      if (event.audioTime <= now) return;
+      if (!pending.has(event.layerId)) {
+        pending.set(event.layerId, event.subdivIndex);
+      }
+    });
+    this.state.layers.forEach((layer) => {
+      if (pending.has(layer.id)) {
+        layer.currentSubdiv = pending.get(layer.id);
+      }
+    });
   }
 
   pausePlayback() {
@@ -542,6 +1168,14 @@ class MetronomeApp {
       clearInterval(this.audioEngine.timerId);
       this.audioEngine.timerId = null;
     }
+
+    // Keep the musical position, but discard the events tied to the old
+    // timeline. AudioContext.currentTime keeps advancing while paused, so
+    // those timestamps are meaningless after resume.
+    this.capturePendingPositions();
+    this.state.clearVisualQueue();
+    this.audioEngine.cancelScheduledVoices();
+
     this.updateTransportUI();
   }
 
@@ -558,7 +1192,8 @@ class MetronomeApp {
     this.state.layers.forEach((layer) => {
       layer.currentSubdiv = 0;
     });
-    this.state.visualQueue = [];
+    this.state.clearVisualQueue();
+    this.audioEngine.cancelScheduledVoices();
 
     // Clear active playhead styles
     document.querySelectorAll('.subdiv-cell.active-playhead').forEach((el) => {
@@ -569,16 +1204,65 @@ class MetronomeApp {
   }
 
   resetPosition() {
+    // Cancel first: otherwise the look-ahead window scheduled for the old
+    // position would still sound after the playhead jumped back to beat 1.
+    this.audioEngine.cancelScheduledVoices();
+    this.state.clearVisualQueue();
+
     this.state.layers.forEach((layer) => {
       layer.currentSubdiv = 0;
       if (this.state.isPlaying && this.audioEngine.audioCtx) {
         layer.nextNoteTime = this.audioEngine.currentTime + 0.05;
       }
     });
-    this.state.visualQueue = [];
     document.querySelectorAll('.subdiv-cell.active-playhead').forEach((el) => {
       el.classList.remove('active-playhead');
     });
+  }
+
+  // Single entry point for every UI path that adds a layer. The count is
+  // checked before anything is created, so a rejected add leaves the state
+  // completely untouched — no create-then-delete, no partial mutation.
+  addLayer(config = {}) {
+    if (this.state.layers.length >= METRONOME_LIMITS.maxLayers) {
+      this.showToast(`已达到 Layer 数量上限 (${METRONOME_LIMITS.maxLayers})，无法继续添加。`);
+      return false;
+    }
+
+    const newLayer = this.state.createLayer(config);
+    this.state.layers.push(newLayer);
+
+    // A newly added layer is small and worth showing in full.
+    this.expandedLayerIds.add(newLayer.id);
+
+    // Append just this card instead of rebuilding the whole list.
+    const card = this.createLayerCardElement(newLayer, this.state.layers.length - 1);
+    this.dom.layersList.appendChild(card);
+    this.updateLayerIndexes();
+    return true;
+  }
+
+  // Removing a layer while playing must also drop its pending visual events
+  // and cancel the voices it already scheduled: the layer element disappears,
+  // so those events could only act on a stale id, and its clicks would
+  // otherwise still sound from the look-ahead window.
+  removeLayer(layerId) {
+    if (this.state.layers.length <= 1) return;
+
+    this.state.layers = this.state.layers.filter((l) => l.id !== layerId);
+    this.state.visualQueue = this.state.visualQueue.filter((event) => event.layerId !== layerId);
+    this.audioEngine.cancelScheduledVoices(layerId);
+
+    // Drop the id from the UI-only expansion set so it cannot leak between
+    // configurations, and remove just that card.
+    this.expandedLayerIds.delete(layerId);
+    this.detachLayerVirtualObserver(layerId);
+    if (this.currentPlayhead) this.currentPlayhead.delete(layerId);
+    this.clearLayerDrafts(layerId);
+    const card = document.getElementById(layerId);
+    if (card && card.parentNode) card.parentNode.removeChild(card);
+
+    this.updateLayerIndexes();
   }
 
   // Scheduler: runs every 25ms, schedules audio ahead of time in AudioContext
@@ -590,9 +1274,14 @@ class MetronomeApp {
 
     this.state.layers.forEach((layer) => {
       if (layer.muted) return;
-      if (layer.numerator <= 0 || layer.denominator <= 0) return;
+      if (!(layer.numerator > 0) || !(layer.denominator > 0)) return;
 
       const subdivDuration = this.state.getSubdivDuration(layer);
+      // A non-finite or non-positive duration would spin this loop forever.
+      if (!Number.isFinite(subdivDuration) || subdivDuration <= 0) {
+        console.warn('Skipping layer with invalid subdivision duration:', layer.id, subdivDuration);
+        return;
+      }
 
       // Catch-up if nextNoteTime fell behind
       if (layer.nextNoteTime < currentTime) {
@@ -609,15 +1298,14 @@ class MetronomeApp {
           beatType,
           layer.sound,
           layer.volume,
-          layer.accentVolume
+          layer.accentVolume,
+          layer.id
         );
 
-        // Enqueue for visual display synchronization
-        this.state.visualQueue.push({
-          layerId: layer.id,
-          subdivIndex: beatIndex,
-          audioTime: layer.nextNoteTime,
-        });
+        // Enqueue for visual display synchronization. The queue orders events
+        // globally by audioTime, so layers with different subdivision
+        // intervals cannot block each other.
+        this.state.enqueueVisualEvent(layer.id, beatIndex, layer.nextNoteTime);
 
         // Advance layer time
         layer.nextNoteTime += subdivDuration;
@@ -632,9 +1320,10 @@ class MetronomeApp {
       if (this.state.isPlaying && this.audioEngine.audioCtx) {
         const now = this.audioEngine.currentTime;
 
-        // Process scheduled visual beats whose audio time has arrived
-        while (this.state.visualQueue.length > 0 && this.state.visualQueue[0].audioTime <= now) {
-          const beat = this.state.visualQueue.shift();
+        // Process every scheduled visual beat whose audio time has arrived,
+        // in chronological order across all layers.
+        const due = this.state.takeDueVisualEvents(now);
+        for (const beat of due) {
           this.highlightBeat(beat.layerId, beat.subdivIndex);
         }
       }
@@ -644,8 +1333,24 @@ class MetronomeApp {
   }
 
   highlightBeat(layerId, subdivIndex) {
+    // Playback position is recorded regardless of what is mounted, so a cell
+    // that scrolls back into view can be painted with the current state. This
+    // never forces mounting — scheduling must not depend on DOM presence.
+    this.currentPlayhead = this.currentPlayhead || new Map();
+    this.currentPlayhead.set(layerId, subdivIndex);
+
     const layerEl = document.getElementById(layerId);
     if (!layerEl) return;
+
+    const wrap = layerEl.querySelector('.subdivision-scroll-wrap');
+
+    // Auto-follow must work even when the target cell is not mounted, so the
+    // target position is computed from geometry rather than measured from a
+    // DOM node. Without this the playhead stopped following once it left the
+    // mounted window.
+    if (wrap) {
+      this.followPlayhead(layerEl, wrap, subdivIndex);
+    }
 
     // Remove previous playhead in this layer
     const prev = layerEl.querySelector('.subdiv-cell.active-playhead');
@@ -653,32 +1358,91 @@ class MetronomeApp {
       prev.classList.remove('active-playhead');
     }
 
-    // Highlight current cell
+    // Highlight current cell — only if this index is currently mounted.
     const cell = layerEl.querySelector(`.subdiv-cell[data-index="${subdivIndex}"]`);
     if (!cell) return;
     cell.classList.add('active-playhead');
 
-    // Horizontal auto-follow: adjust ONLY this layer's own scroll wrapper by
-    // setting its scrollLeft directly. Never uses scrollIntoView or any API
-    // that could scroll the page. Follows only when the cell leaves the
-    // wrapper's visible content box, and by the minimum distance needed —
-    // so a user's manual horizontal position is not reset every beat.
-    const wrap = layerEl.querySelector('.subdivision-scroll-wrap');
-    if (!wrap) return;
-    const wrapRect = wrap.getBoundingClientRect();
-    const cellRect = cell.getBoundingClientRect();
-    const cs = getComputedStyle(wrap);
-    const leftEdge = wrapRect.left + (parseFloat(cs.paddingLeft) || 0);
-    const rightEdge = wrapRect.right - (parseFloat(cs.paddingRight) || 0);
-    let delta = 0;
-    if (cellRect.left < leftEdge) {
-      delta = cellRect.left - leftEdge;
-    } else if (cellRect.right > rightEdge) {
-      delta = cellRect.right - rightEdge;
+    // Mounted and highlighted: the pending request has been satisfied.
+    if (this.pendingCellIndex) this.pendingCellIndex.delete(layerId);
+  }
+
+  // Scroll this layer's pattern scroller so the given beat is visible, using
+  // only geometry (the cell may not exist yet). Called at most once per beat,
+  // and only scrolls when the beat is actually outside the visible band, so a
+  // user's manual horizontal position is preserved and no layout is forced per
+  // audio event.
+  followPlayhead(layerEl, wrap, subdivIndex) {
+    const grid = wrap.querySelector('.subdivision-grid');
+    if (!grid) return;
+
+    const layer = this.state.layers.find((l) => l.id === layerEl.id);
+    if (!layer) return;
+
+    // FAST PATH: the beat is already mounted AND inside the visible band.
+    // highlightBeat() paints the class in place, so no scroll, no pending
+    // request and no rebuild is needed. This is what keeps playback inside one
+    // range free of DOM churn even when page-scroll refreshes land per frame.
+    // A beat that is mounted only in the overscan margin still falls through
+    // so auto-follow keeps the playhead visibly centred.
+    const mounted = layer.__virtual && layer.__virtual.cells;
+    const viewLeftNow = wrap.scrollLeft || 0;
+    const viewWidthNow = wrap.clientWidth || 0;
+    const pitchNow = this.getCellGeometry(grid).itemWidth;
+    if (mounted && subdivIndex >= mounted.start && subdivIndex < mounted.end &&
+        pitchNow > 0 && viewWidthNow > 0) {
+      const left = subdivIndex * pitchNow;
+      const right = left + pitchNow;
+      if (left >= viewLeftNow && right <= viewLeftNow + viewWidthNow) return;
     }
-    if (delta !== 0) {
-      wrap.scrollLeft += delta;
+
+    const geom = this.getCellGeometry(grid);
+    const pitch = geom.itemWidth;
+    if (!(pitch > 0)) return;
+
+    // Full grid width from geometry, never from scrollWidth: the scroller's
+    // content width collapses whenever the mounted window is rebuilt.
+    const contentWidth = layer.numerator * pitch;
+    if (!(contentWidth > 0)) return;
+
+    const viewWidth = wrap.clientWidth || 0;
+    if (!(viewWidth > 0)) return;
+
+    const cellLeft = subdivIndex * pitch;
+    const cellRight = cellLeft + pitch;
+
+    const viewLeft = wrap.scrollLeft;
+    const viewRight = viewLeft + viewWidth;
+
+    const margin = Math.min(pitch * 2, Math.max(0, viewWidth / 4));
+
+    let target = null;
+    if (cellLeft < viewLeft + margin) {
+      target = Math.max(0, cellLeft - margin);
+    } else if (cellRight > viewRight - margin) {
+      target = Math.min(Math.max(0, contentWidth - viewWidth),
+        cellRight - viewWidth + margin);
     }
+    if (target === null) return;
+
+    // 1. Ensure the target beat is inside the mounted window. Use the focus-
+    //    aware refresh path: a directly mounted cell would destroy a focused
+    //    cell without restoring it when playback follows across windows.
+    this.requestCellVisible(layerEl.id, subdivIndex);
+    this.refreshLayerVirtualWindows(layerEl.id, 'cells');
+
+    // 2. Only now does the grid span the full width, so the scroll sticks.
+    const freshWrap = layerEl.querySelector('.subdivision-scroll-wrap') || wrap;
+    freshWrap.scrollLeft = target;
+    wrap.scrollLeft = target;
+  }
+
+  // Ask for a specific beat to be included in the next cell window.
+  requestCellVisible(layerId, subdivIndex) {
+    const layer = this.state.layers.find((l) => l.id === layerId);
+    if (!layer || !this.isLayerExpanded(layerId)) return;
+    this.pendingCellIndex = this.pendingCellIndex || new Map();
+    this.pendingCellIndex.set(layerId, subdivIndex);
   }
 
   // ==========================================================================
@@ -742,13 +1506,11 @@ class MetronomeApp {
 
     // Add Layer
     this.dom.addLayerBtn.addEventListener('click', () => {
-      const newLayer = this.state.createLayer({
+      this.addLayer({
         name: `Layer ${this.state.layers.length + 1}`,
         numerator: 16,
         denominator: 16,
       });
-      this.state.layers.push(newLayer);
-      this.renderLayers();
     });
 
     // Share URL
@@ -763,11 +1525,10 @@ class MetronomeApp {
   }
 
   setBpm(newBpm) {
-    if (isNaN(newBpm)) newBpm = 120;
-    newBpm = Math.max(20, Math.min(600, Math.round(newBpm)));
-    this.state.bpm = newBpm;
-    this.dom.bpmInput.value = newBpm;
-    this.dom.bpmSlider.value = newBpm;
+    // Shared limit, so the UI cannot set a BPM that import would clamp.
+    this.state.bpm = clampInt(newBpm, METRONOME_LIMITS.bpm, 120);
+    this.dom.bpmInput.value = this.state.bpm;
+    this.dom.bpmSlider.value = this.state.bpm;
   }
 
   handleTap() {
@@ -826,11 +1587,54 @@ class MetronomeApp {
     this.renderLayers();
   }
 
+  // Collapse policy, applied when a configuration is swapped in (preset load,
+  // URL import) rather than on every incremental re-render.
+  shouldStartCollapsed(layer) {
+    const policy = LAYER_RENDER_POLICY;
+    if (layer.numerator > policy.autoCollapseLayerSubdivisions) return true;
+    if (this.state.layers.length >= policy.autoCollapseLayerCount) return true;
+
+    let total = 0;
+    for (const l of this.state.layers) {
+      total += l.numerator;
+      if (total > policy.autoCollapseTotalSubdivisions) return true;
+    }
+    return false;
+  }
+
+  // Apply the default expansion state for the configuration now in state.
+  // Small configurations keep the historical behaviour (everything expanded).
+  applyInitialExpansionState() {
+    this.expandedLayerIds = new Set();
+    for (const layer of this.state.layers) {
+      if (!this.shouldStartCollapsed(layer)) {
+        this.expandedLayerIds.add(layer.id);
+      }
+    }
+  }
+
+  isLayerExpanded(layerId) {
+    return this.expandedLayerIds.has(layerId);
+  }
+
+  // Full rebuild of the list. Used when the set of layers changes (load,
+  // import, add, remove) — individual edits take a narrower path below.
   renderLayers() {
-    this.dom.layersList.innerHTML = '';
+    const fragment = document.createDocumentFragment();
     this.state.layers.forEach((layer, index) => {
-      const card = this.createLayerCardElement(layer, index);
-      this.dom.layersList.appendChild(card);
+      fragment.appendChild(this.createLayerCardElement(layer, index));
+    });
+    this.dom.layersList.replaceChildren(fragment);
+    this.updateLayerIndexes();
+  }
+
+  // Renumber the #N tags without touching anything else.
+  updateLayerIndexes() {
+    this.state.layers.forEach((layer, index) => {
+      const card = document.getElementById(layer.id);
+      if (!card) return;
+      const tag = card.querySelector('.layer-tag');
+      if (tag) tag.textContent = `#${index + 1}`;
     });
   }
 
@@ -838,22 +1642,45 @@ class MetronomeApp {
     const card = document.createElement('div');
     card.className = `layer-card ${layer.muted ? 'muted' : ''}`;
     card.id = layer.id;
+    const expanded = this.isLayerExpanded(layer.id);
+    card.dataset.expanded = expanded ? '1' : '0';
+    if (!expanded) card.classList.add('collapsed');
 
-    // Calculate grouping sum & validation
-    const groupSum = layer.groups.reduce((a, b) => a + b, 0);
-    const isSumValid = groupSum === layer.numerator;
-    const diff = groupSum - layer.numerator;
-    const diffText = diff > 0 ? `+${diff}` : `${diff}`;
+    const accentBar = document.createElement('div');
+    accentBar.className = 'layer-accent-bar';
+    accentBar.style.background = layer.color;
+    card.appendChild(accentBar);
 
-    card.innerHTML = `
-      <div class="layer-accent-bar" style="background: ${layer.color};"></div>
-      <div class="layer-main">
+    const main = document.createElement('div');
+    main.className = 'layer-main';
+    main.innerHTML = this.layerHeaderHtml(layer, index);
 
-        <!-- Top Header Bar -->
+    // Detail host: always present, contents depend on expansion state.
+    const detailHost = document.createElement('div');
+    detailHost.className = 'layer-detail';
+    main.appendChild(detailHost);
+    card.appendChild(main);
+
+    this.bindLayerHeaderEvents(card, layer);
+
+    if (expanded) {
+      this.renderLayerDetail(layer, card);
+    }
+
+    return card;
+  }
+
+  // Header + controls only. No grouping tags, no subdivision cells, and no
+  // card-level wrapper: the caller owns .layer-main, so this fragment starts at
+  // the header bar. Returning another accent bar / .layer-main here used to
+  // nest a second copy inside the first.
+  layerHeaderHtml(layer, index) {
+    return `
         <div class="layer-header-bar">
           <div class="layer-title-group">
             <span class="layer-tag" style="background: ${layer.color}22; color: ${layer.color};">#${index + 1}</span>
             <input type="text" class="layer-name-input" value="${this.escapeHtml(layer.name)}">
+            <span class="layer-summary">${this.layerSummaryText(layer)}</span>
           </div>
 
           <!-- Time Signature Input -->
@@ -897,154 +1724,1353 @@ class MetronomeApp {
             </div>
 
             <div class="layer-btn-actions">
+              <button class="expand-btn" title="展开 / 折叠该 Layer 的详细内容">${this.isLayerExpanded(layer.id) ? '▾' : '▸'}</button>
               <button class="mute-btn ${layer.muted ? 'active' : ''}">MUTE</button>
               ${this.state.layers.length > 1 ? '<button class="del-layer-btn" title="删除当前 Layer">✕</button>' : ''}
             </div>
           </div>
-        </div>
+    `;
+  }
 
-        <!-- Grouping Bar -->
-        <div class="grouping-bar">
-          <div class="grouping-top">
-            <div class="grouping-info">
-              <span class="grouping-title">节奏分组 (Grouping)</span>
-              <span class="grouping-sum-badge ${isSumValid ? '' : 'error'}">
-                ${isSumValid ? `和 = ${groupSum} ✓` : `和 = ${groupSum} / 需 ${layer.numerator} (${diffText})`}
-              </span>
-            </div>
+  // Compact one-line summary shown while collapsed, so a collapsed layer still
+  // communicates its grouping state without building the full editor.
+  layerSummaryText(layer) {
+    const groupSum = layer.groups.reduce((a, b) => a + b, 0);
+    const valid = groupSum === layer.numerator;
+    const groups = layer.groups.length;
+    return valid
+      ? `${groups} 组 · 和 ${groupSum} ✓`
+      : `${groups} 组 · 和 ${groupSum}/${layer.numerator}`;
+  }
 
-            <div class="grouping-quick-actions">
-              <button class="btn btn-sm btn-auto-group" title="按3+3+2模式自动填充">自动分组</button>
-              <button class="btn btn-sm btn-even-group" title="在当前组数间平均分配拍数">平均分配</button>
-              <button class="btn btn-sm btn-group-accent" title="将各组起点标记为重音">组首重音</button>
-              <button class="btn btn-sm btn-clear-group" title="清空所有分组">清空</button>
-            </div>
+  groupingBadgeHtml(layer) {
+    const groupSum = layer.groups.reduce((a, b) => a + b, 0);
+    const isSumValid = groupSum === layer.numerator;
+    const diff = groupSum - layer.numerator;
+    const diffText = diff > 0 ? `+${diff}` : `${diff}`;
+    return isSumValid
+      ? `和 = ${groupSum} ✓`
+      : `和 = ${groupSum} / 需 ${layer.numerator} (${diffText})`;
+  }
+
+  // Build (or rebuild) the expandable part of one card.
+  renderLayerDetail(layer, card) {
+    const host = card.querySelector('.layer-detail');
+    if (!host) return;
+
+    host.innerHTML = `
+      <div class="grouping-bar">
+        <div class="grouping-top">
+          <div class="grouping-info">
+            <span class="grouping-title">节奏分组 (Grouping)</span>
+            <span class="grouping-sum-badge ${this.groupingBadgeHtml(layer).includes('✓') ? '' : 'error'}">${this.groupingBadgeHtml(layer)}</span>
           </div>
 
-          <!-- Group Tags Editor -->
-          <div class="groups-tags-container">
-            ${layer.groups.map((val, gIdx) => `
-              <div class="group-tag" data-gidx="${gIdx}">
-                ${gIdx > 0 ? '<button class="group-tag-btn group-move-left" title="左移">◀</button>' : ''}
-                <input type="number" class="group-tag-val" min="1" max="512" value="${val}">
-                ${gIdx < layer.groups.length - 1 ? '<button class="group-tag-btn group-move-right" title="右移">▶</button>' : ''}
-                <button class="group-tag-btn group-tag-del" title="删除该组">×</button>
-              </div>
-            `).join('')}
-            <button class="add-group-btn">+ 添加组</button>
-          </div>
-        </div>
-
-        <!-- Subdivision Interactive Grid -->
-        <div class="grid-container">
-          <div class="grid-top-actions">
-            <div class="grid-legend">
-              <div class="legend-item"><span class="legend-dot accent"></span> ● 重音 (Accent)</div>
-              <div class="legend-item"><span class="legend-dot normal"></span> ○ 普音 (Normal)</div>
-              <div class="legend-item"><span class="legend-dot mute"></span> × 静音 (Mute)</div>
-              <span style="color: var(--text-muted); margin-left: 6px;">(点击任意单元格循环切换)</span>
-            </div>
-
-            <div class="grid-action-btns">
-              <button class="btn btn-sm btn-reset-pattern" title="恢复为分组默认重音">重置 Pattern</button>
-              <button class="btn btn-sm btn-all-normal" title="全部设为普通音">全部普音</button>
-              <button class="btn btn-sm btn-random-pattern" title="随机生成重音/静音">随机 Pattern</button>
-            </div>
-          </div>
-
-          <!-- Scrollable Cells -->
-          <div class="subdivision-scroll-wrap">
-            <div class="subdivision-grid">
-              ${this.renderSubdivisionCellsHtml(layer)}
-            </div>
+          <div class="grouping-quick-actions">
+            <button class="btn btn-sm btn-auto-group" title="按3+3+2模式自动填充">自动分组</button>
+            <button class="btn btn-sm btn-even-group" title="在当前组数间平均分配拍数">平均分配</button>
+            <button class="btn btn-sm btn-group-accent" title="将各组起点标记为重音">组首重音</button>
+            <button class="btn btn-sm btn-clear-group" title="清空所有分组">清空</button>
           </div>
         </div>
 
+        <div class="groups-tags-container">
+          <div class="groups-tags-list" data-virtual="groups"></div>
+          <button class="add-group-btn">+ 添加组</button>
+        </div>
+      </div>
+
+      <div class="grid-container">
+        <div class="grid-top-actions">
+          <div class="grid-legend">
+            <div class="legend-item"><span class="legend-dot accent"></span> ● 重音 (Accent)</div>
+            <div class="legend-item"><span class="legend-dot normal"></span> ○ 普音 (Normal)</div>
+            <div class="legend-item"><span class="legend-dot mute"></span> × 静音 (Mute)</div>
+            <span style="color: var(--text-muted); margin-left: 6px;">(点击任意单元格循环切换)</span>
+          </div>
+
+          <div class="grid-action-btns">
+            <button class="btn btn-sm btn-reset-pattern" title="恢复为分组默认重音">重置 Pattern</button>
+            <button class="btn btn-sm btn-all-normal" title="全部设为普通音">全部普音</button>
+            <button class="btn btn-sm btn-random-pattern" title="随机生成重音/静音">随机 Pattern</button>
+          </div>
+        </div>
+
+        <div class="subdivision-scroll-wrap">
+          <div class="subdivision-grid" data-virtual="cells"></div>
+        </div>
       </div>
     `;
 
-    this.bindLayerCardEvents(card, layer);
-    return card;
+    this.bindLayerDetailEvents(card, layer);
+    this.mountLayerVirtualWindows(layer, card);
+    this.attachLayerVirtualObserver(layer, card);
   }
 
-  renderSubdivisionCellsHtml(layer) {
-    const cellsHtml = [];
-    let groupStartIndices = new Set();
-    let pos = 0;
-    layer.groups.forEach((size) => {
-      groupStartIndices.add(pos);
-      pos += size;
+  // --------------------------------------------------------------------------
+  // Virtualised mounting for the two large per-layer collections
+  // --------------------------------------------------------------------------
+  //
+  // Both collections are rebuilt from `layer` on every window change, so the
+  // DOM never holds a stale copy: state stays the only source of truth.
+
+  mountLayerVirtualWindows(layer, card) {
+    this.mountGroupWindow(layer, card);
+    this.mountCellWindow(layer, card);
+  }
+
+  // --- Group tags -----------------------------------------------------------
+  //
+  // Tags wrap, so the layout unit is a ROW, not a single tag. Every window
+  // calculation below is done in rows and only converted to group indexes at
+  // the very end — mixing the two units was the original bug.
+
+  /**
+   * Decide whether a host already represents the requested window.
+   *
+   * Scrolling produces a refresh per frame, but the mounted slice only changes
+   * when the range actually moves. Rebuilding identical content throws away
+   * focused inputs and cells and churns the DOM, so an identical window is a
+   * no-op. `sig` carries every quantity that affects the rendered result:
+   * range, geometry and any data revision, so a real change can never be
+   * skipped.
+   */
+  windowIsCurrent(host, sig) {
+    const prev = host.__windowSig;
+    if (!prev) return false;
+    if (prev.kind !== sig.kind) return false;
+    if (prev.start !== sig.start || prev.end !== sig.end) return false;
+    if (prev.geom !== sig.geom) return false;
+    if (prev.rev !== sig.rev) return false;
+    if (prev.minimal !== sig.minimal) return false;
+    // Cell windows additionally depend on the roving cursor and any pending
+    // focus/follow request — but NOT on the playhead beat index, which is
+    // dynamic presentation state painted in place by highlightBeat().
+    if (prev.cursor !== sig.cursor) return false;
+    if (prev.pending !== sig.pending) return false;
+    return true;
+  }
+
+  markWindowCurrent(host, sig) {
+    host.__windowSig = sig;
+  }
+
+  // Bumped whenever anything that affects rendered content changes outside the
+  // window range (groups edited, layer data replaced, sources toggled).
+  bumpLayerDataRevision(layer) {
+    layer.__dataRev = (layer.__dataRev || 0) + 1;
+  }
+
+  mountGroupWindow(layer, card) {
+    const host = card.querySelector('.groups-tags-list');
+    if (!host) return false;
+    // A real (viewport-driven) mount supersedes any minimal mount.
+    host.__minimal = false;
+
+    const totalGroups = layer.groups.length;
+    const geom = this.getGroupGeometry(host, layer);
+    const perRow = geom.itemsPerRow;
+    const totalRows = Math.max(1, Math.ceil(totalGroups / perRow));
+
+    // Small lists mount in full; no virtualisation, no spacers.
+    if (totalGroups <= VIRTUAL_POLICY.fullRenderThreshold) {
+      const sig = {
+        kind: 'groups-full',
+        start: 0,
+        end: totalGroups,
+        geom: `full|${totalGroups}|${perRow}`,
+        rev: layer.__dataRev || 0,
+        minimal: false,
+      };
+      // Return false when the DOM was left untouched, so callers skip a
+      // needless focus restore that would disturb an input being edited.
+      if (this.windowIsCurrent(host, sig)) return false;
+
+      host.innerHTML = '';
+      const all = document.createElement('div');
+      all.className = 'groups-tags-mounted';
+      const allParts = [];
+      for (let i = 0; i < totalGroups; i++) allParts.push(this.groupTagHtml(layer, i));
+      all.innerHTML = allParts.join('');
+      host.appendChild(all);
+      layer.__virtual = layer.__virtual || {};
+      layer.__virtual.groups = { start: 0, end: totalGroups };
+      this.markWindowCurrent(host, sig);
+      return true;
+    }
+
+    const hostRect = this.rectOf(host);
+    // Tags scroll with the page, so the visible slice is expressed in the
+    // list's own coordinate space. Units: rows.
+    const visibleRows = computeVisibleRange({
+      total: totalRows,
+      viewportStart: -hostRect.top,
+      viewportEnd: this.viewportHeight() - hostRect.top,
+      itemSize: geom.rowHeight,
+      overscan: VIRTUAL_POLICY.overscanRows,
+      minItems: VIRTUAL_POLICY.minGroupRows,
     });
 
-    for (let i = 0; i < layer.numerator; i++) {
-      const type = this.state.getBeatType(layer, i);
-      const isGroupStart = groupStartIndices.has(i) && i > 0;
-      const symbol = type === 'accent' ? '●' : (type === 'mute' ? '×' : '○');
+    const startRow = Math.max(0, Math.min(totalRows, visibleRows.start));
+    const endRow = Math.max(startRow, Math.min(totalRows, visibleRows.end));
 
-      cellsHtml.push(`
-        <div class="subdiv-cell-wrap ${isGroupStart ? 'group-start' : ''}">
-          <div class="subdiv-cell ${type}" data-index="${i}" title="第 ${i + 1} 拍：${type}">
-            <span class="cell-icon">${symbol}</span>
-          </div>
-          <span class="cell-num">${i + 1}</span>
-        </div>
-      `);
+    // Convert whole rows to group indexes. No second division by perRow.
+    const start = startRow * perRow;
+    const end = Math.min(totalGroups, endRow * perRow);
+
+    const sig = {
+      kind: 'groups-virtual',
+      start,
+      end,
+      geom: `${perRow}|${Math.round(geom.rowHeight)}|${Math.round(geom.itemWidth)}`,
+      rev: layer.__dataRev || 0,
+      minimal: false,
+    };
+    if (this.windowIsCurrent(host, sig)) return false;
+
+    const parts = [];
+    for (let i = start; i < end; i++) {
+      parts.push(this.groupTagHtml(layer, i));
     }
-    return cellsHtml.join('');
+
+    const beforeRows = startRow;
+    const afterRows = Math.max(0, totalRows - endRow);
+    const beforeH = beforeRows * geom.rowHeight;
+    const afterH = afterRows * geom.rowHeight;
+
+    host.innerHTML = '';
+    if (beforeH > 0) {
+      const spacer = document.createElement('div');
+      spacer.className = 'virtual-spacer';
+      spacer.style.height = `${beforeH}px`;
+      host.appendChild(spacer);
+    }
+
+    const row = document.createElement('div');
+    row.className = 'groups-tags-mounted';
+    row.innerHTML = parts.join('');
+    host.appendChild(row);
+
+    if (afterH > 0) {
+      const spacer = document.createElement('div');
+      spacer.className = 'virtual-spacer';
+      spacer.style.height = `${afterH}px`;
+      host.appendChild(spacer);
+    }
+
+    layer.__virtual = layer.__virtual || {};
+    layer.__virtual.groups = { start, end };
+    this.markWindowCurrent(host, sig);
+    return true;
+  }
+
+  // --- Pattern cells --------------------------------------------------------
+
+  mountCellWindow(layer, card) {
+    const grid = card.querySelector('.subdivision-grid');
+    if (!grid) return false;
+    grid.__minimal = false;
+
+    const wrap = card.querySelector('.subdivision-scroll-wrap');
+    const total = layer.numerator;
+    const geom = this.getCellGeometry(grid);
+
+    // The grid is a horizontal scroller inside the card. The scroll position
+    // is taken from an explicit hand-off when a mount is triggered by playback
+    // following or by keyboard navigation, because the browser may not have
+    // applied a just-assigned scrollLeft yet.
+    const wrapWidth = wrap && wrap.clientWidth ? wrap.clientWidth : this.viewportWidth();
+    let scrollLeft = wrap ? wrap.scrollLeft : 0;
+    if (layer.__pendingScrollLeft !== undefined && layer.__pendingScrollLeft !== null) {
+      scrollLeft = layer.__pendingScrollLeft;
+      layer.__pendingScrollLeft = null;
+    }
+
+    const visible = computeVisibleRange({
+      total,
+      viewportStart: scrollLeft,
+      viewportEnd: scrollLeft + wrapWidth,
+      itemSize: geom.itemWidth,
+      overscan: VIRTUAL_POLICY.overscanItems,
+      minItems: VIRTUAL_POLICY.minWindowItems,
+    });
+    const win = computeEffectiveWindow(total, visible);
+
+    // A pending focus/playhead request must be inside the mounted slice,
+    // otherwise the scroll maths and the DOM would disagree by one window.
+    // It is NOT cleared here: clearing is done only once the caller confirms
+    // the cell is mounted, because a stale scrollLeft (the browser clamps it
+    // to 0 while the grid is momentarily empty) can otherwise recompute a
+    // window that excludes the pending beat.
+    let start = win.start;
+    let end = win.end;
+    const pending = this.pendingCellIndex && this.pendingCellIndex.get(layer.id);
+    if (Number.isInteger(pending) && pending >= 0 && pending < total &&
+        (pending < start || pending >= end)) {
+      // The target is outside the window: build a bounded window AROUND it
+      // instead of stretching the old one (which could mount 0..pending and
+      // destroy the whole point of virtualisation on a long jump).
+      const half = Math.max(VIRTUAL_POLICY.minWindowItems, 2 * VIRTUAL_POLICY.overscanItems + 1);
+      start = Math.max(0, pending - half);
+      end = Math.min(total, pending + half);
+      // Keep the window at least the minimum size.
+      if (end - start < VIRTUAL_POLICY.minWindowItems) {
+        end = Math.min(total, start + VIRTUAL_POLICY.minWindowItems);
+        start = Math.max(0, end - VIRTUAL_POLICY.minWindowItems);
+      }
+    }
+    if (Number.isInteger(pending) && pending >= 0 && pending < total) {
+      // The window now guarantees the target is mounted; the request is
+      // satisfied. Clearing here keeps the steady-state signature stable.
+      if (this.pendingCellIndex) this.pendingCellIndex.delete(layer.id);
+    }
+
+    const starts = this.groupStartSet(layer);
+    const sig = {
+      kind: 'cells',
+      start,
+      end,
+      geom: `${Math.round(geom.itemWidth)}|${total}`,
+      rev: layer.__dataRev || 0,
+      minimal: false,
+      // The playhead is deliberately NOT part of the structural signature.
+      // highlightBeat() updates the active-playhead class in place, so a beat
+      // change must not invalidate the window: doing so rebuilt the whole
+      // Pattern DOM on the next page-scroll refresh during playback. Newly
+      // mounted cells still pick up the current playhead through
+      // subdivCellHtml(), which runs whenever a REAL window change occurs.
+      cursor: this.gridCursor && this.gridCursor.get(layer.id),
+      // A pending request means the caller expects the target beat to be
+      // mounted on THIS pass; an otherwise identical signature must not skip it.
+      // It is a boolean trigger, not part of the steady-state signature, so
+      // clearing the pending map after the mount does not force a second rebuild.
+      pending: (this.pendingCellIndex && this.pendingCellIndex.has(layer.id)) ? 1 : 0,
+    };
+    if (this.windowIsCurrent(grid, sig)) return false;
+
+    const parts = [];
+    for (let i = start; i < end; i++) {
+      parts.push(this.subdivCellHtml(layer, i, starts));
+    }
+
+    // Every .subdiv-cell-wrap has a fixed pitch (see style.css), including
+    // group-start markers, so index * itemWidth is the exact layout width.
+    const beforeW = start * geom.itemWidth;
+    const afterW = Math.max(0, (total - end) * geom.itemWidth);
+
+    grid.innerHTML = '';
+    if (beforeW > 0) {
+      const spacer = document.createElement('div');
+      spacer.className = 'virtual-spacer-h';
+      spacer.style.width = `${beforeW}px`;
+      grid.appendChild(spacer);
+    }
+
+    const band = document.createElement('div');
+    band.className = 'subdiv-cells-mounted';
+    band.innerHTML = parts.join('');
+    grid.appendChild(band);
+
+    if (afterW > 0) {
+      const spacer = document.createElement('div');
+      spacer.className = 'virtual-spacer-h';
+      spacer.style.width = `${afterW}px`;
+      grid.appendChild(spacer);
+    }
+
+    // NOTE: scrollLeft is intentionally NOT restored here. Replacing the
+    // grid's children keeps the scroller's own position, and callers that
+    // need a specific offset (playback follow, keyboard focus) set it after
+    // this returns, when the full-width spacers exist.
+
+    layer.__virtual = layer.__virtual || {};
+    layer.__virtual.cells = { start, end };
+    layer.__virtual.starts = starts;
+    this.markWindowCurrent(grid, sig);
+    return true;
+  }
+
+  groupStartSet(layer) {
+    const starts = new Set();
+    let pos = 0;
+    layer.groups.forEach((size) => {
+      starts.add(pos);
+      pos += size;
+    });
+    return starts;
+  }
+
+  // Every tag carries the same two move buttons so the flex row wraps at a
+  // uniform pitch. At the boundaries the button that cannot act is rendered
+  // disabled rather than omitted: omitting it made the first and last tag
+  // narrower, so the virtual row model disagreed with the real layout.
+  groupTagHtml(layer, gIdx) {
+    const committed = layer.groups[gIdx];
+    const draft = this.getGroupDraft(layer.id, gIdx);
+    // An uncommitted draft wins for DISPLAY only. It is never written back to
+    // layer.groups here, and mounting never focuses the input. The draft is a
+    // raw DOM string, so escape it before interpolating into an attribute.
+    const val = this.escapeHtml(String(draft !== undefined ? draft : committed));
+    const isFirst = gIdx === 0;
+    const isLast = gIdx === layer.groups.length - 1;
+    return (
+      `<div class="group-tag" data-gidx="${gIdx}">` +
+        `<button class="group-tag-btn group-move-left" title="左移"${isFirst ? ' disabled' : ''}>◀</button>` +
+        `<input type="number" class="group-tag-val" min="1" max="512" value="${val}">` +
+        `<button class="group-tag-btn group-move-right" title="右移"${isLast ? ' disabled' : ''}>▶</button>` +
+        '<button class="group-tag-btn group-tag-del" title="删除该组">×</button>' +
+      '</div>'
+    );
+  }
+
+  subdivCellHtml(layer, index, starts) {
+    const type = this.state.getBeatType(layer, index);
+    const isGroupStart = starts.has(index) && index > 0;
+    const symbol = type === 'accent' ? '●' : (type === 'mute' ? '×' : '○');
+    // A cell mounted while playing must show the current playhead immediately;
+    // otherwise scrolling during playback would show stale visual state.
+    const isPlayhead = this.currentPlayhead &&
+      this.currentPlayhead.get(layer.id) === index &&
+      this.state.isPlaying;
+
+    // Roving tabindex: exactly one cell per grid is a Tab stop, so the keyboard
+    // does not have to walk thousands of cells. The roving index is the shared
+    // logical cursor (this.gridCursor), which survives remounting.
+    const cursor = this.gridCursor && this.gridCursor.get(layer.id);
+    const isTabStop = cursor === undefined ? index === 0 : cursor === index;
+
+    const label = `第 ${index + 1} 拍：${type}`;
+    return `
+      <div class="subdiv-cell-wrap ${isGroupStart ? 'group-start' : ''}">
+        <div class="subdiv-cell ${type}${isPlayhead ? ' active-playhead' : ''}"
+             data-index="${index}"
+             tabindex="${isTabStop ? '0' : '-1'}"
+             role="button"
+             aria-label="${label}"
+             aria-pressed="${type === 'mute' ? 'false' : 'true'}"
+             title="${label}">
+          <span class="cell-icon" aria-hidden="true">${symbol}</span>
+        </div>
+        <span class="cell-num" aria-hidden="true">${index + 1}</span>
+      </div>
+    `;
+  }
+
+  // Cycle one beat and repaint just that cell.
+  toggleCell(layer, cell) {
+    const index = parseInt(cell.dataset.index, 10);
+    if (!Number.isInteger(index)) return;
+
+    const currentType = this.state.getBeatType(layer, index);
+    const nextType = this.state.cycleBeatType(currentType);
+    layer.overrides[index] = nextType;
+
+    this.paintCell(cell, index, nextType);
+  }
+
+  paintCell(cell, index, type) {
+    const wasPlayhead = cell.classList.contains('active-playhead');
+    cell.className = `subdiv-cell ${type}${wasPlayhead ? ' active-playhead' : ''}`;
+    const icon = cell.querySelector('.cell-icon');
+    if (icon) icon.textContent = type === 'accent' ? '●' : (type === 'mute' ? '×' : '○');
+    const label = `第 ${index + 1} 拍：${type}`;
+    cell.title = label;
+    if (cell.setAttribute) {
+      cell.setAttribute('aria-label', label);
+      cell.setAttribute('aria-pressed', type === 'mute' ? 'false' : 'true');
+    }
+  }
+
+  // Roving tabindex cursor: the logical index that owns the Tab stop.
+  setGridCursor(layer, index) {
+    this.gridCursor = this.gridCursor || new Map();
+    const previous = this.gridCursor.get(layer.id);
+    if (previous === index) return;
+    this.gridCursor.set(layer.id, index);
+
+    const card = document.getElementById(layer.id);
+    if (!card) return;
+    const grid = card.querySelector('.subdivision-grid');
+    if (!grid) return;
+    for (const el of grid.querySelectorAll('.subdiv-cell')) {
+      const i = parseInt(el.dataset.index, 10);
+      el.tabIndex = i === index ? 0 : -1;
+    }
+  }
+
+  handleGridKeydown(e, layer, cell) {
+    const index = parseInt(cell.dataset.index, 10);
+    if (!Number.isInteger(index)) return;
+
+    const total = layer.numerator;
+    let target = null;
+
+    switch (e.key) {
+      case 'ArrowRight':
+        target = Math.min(total - 1, index + 1);
+        break;
+      case 'ArrowLeft':
+        target = Math.max(0, index - 1);
+        break;
+      case 'Home':
+        target = 0;
+        break;
+      case 'End':
+        target = total - 1;
+        break;
+      case 'Enter':
+      case ' ':
+        e.preventDefault();
+        this.toggleCell(layer, cell);
+        return;
+      default:
+        return;
+    }
+
+    e.preventDefault();
+    this.focusCell(layer, target);
+  }
+
+  /**
+   * Move keyboard focus to a logical beat index, mounting it first if the
+   * virtual window does not currently include it.
+   *
+   * The scroll position is derived from geometry, so it works while the target
+   * cell does not exist yet; the pending index then forces the next mount to
+   * include it before focus is applied.
+   */
+  focusCell(layer, index) {
+    if (!Number.isInteger(index) || index < 0 || index >= layer.numerator) return;
+
+    this.gridCursor = this.gridCursor || new Map();
+    this.gridCursor.set(layer.id, index);
+
+    const card = document.getElementById(layer.id);
+    if (!card) return;
+    const wrap = card.querySelector('.subdivision-scroll-wrap');
+    const grid = card.querySelector('.subdivision-grid');
+    if (!wrap || !grid) return;
+
+    const geom = this.getCellGeometry(grid);
+    const pitch = geom.itemWidth;
+    const viewWidth = wrap.clientWidth || 0;
+
+    // Bring the target into the horizontal band before asking for a mount.
+    if (pitch > 0 && viewWidth > 0) {
+      const cellLeft = index * pitch;
+      const cellRight = cellLeft + pitch;
+      if (cellLeft < wrap.scrollLeft) {
+        wrap.scrollLeft = cellLeft;
+      } else if (cellRight > wrap.scrollLeft + viewWidth) {
+        wrap.scrollLeft = cellRight - viewWidth;
+      }
+    }
+
+    this.pendingCellIndex = this.pendingCellIndex || new Map();
+    this.pendingCellIndex.set(layer.id, index);
+    this.mountCellWindow(layer, card);
+
+    const target = grid.querySelector(`.subdiv-cell[data-index="${index}"]`);
+    if (target) {
+      this.pendingCellIndex.delete(layer.id);
+      if (typeof target.focus === 'function') target.focus();
+      this.setGridCursor(layer, index);
+    }
+  }
+
+  // --- Geometry -------------------------------------------------------------
+
+  rectOf(el) {
+    if (el && typeof el.getBoundingClientRect === 'function') {
+      const r = el.getBoundingClientRect();
+      if (r && Number.isFinite(r.top)) return r;
+    }
+    return { top: 0, left: 0, width: 0, height: 0, bottom: 0, right: 0 };
+  }
+
+  viewportHeight() {
+    const win = (typeof window !== 'undefined' && window) || {};
+    const h = win.innerHeight;
+    return Number.isFinite(h) && h > 0 ? h : 800;
+  }
+
+  viewportWidth() {
+    const win = (typeof window !== 'undefined' && window) || {};
+    const w = win.innerWidth;
+    return Number.isFinite(w) && w > 0 ? w : 1280;
+  }
+
+  // Measured tag geometry.
+  //
+  // Tags differ in width: the first has no left-move button and the last has
+  // no right-move button, so measuring only one tag would be wrong. Instead the
+  // geometry deliberately uses a FIXED column model derived from the widest
+  // tag, which makes wrapping identical for every row and therefore exactly
+  // predictable for the spacers.
+  //
+  // A fallback result is never cached permanently: `measured` records whether
+  // real elements were available, and a later call re-measures once they are.
+  getGroupGeometry(host, layer) {
+    const cached = host.__geom;
+    if (cached && cached.measured) return cached;
+
+    const total = layer ? layer.groups.length : (host.querySelectorAll('.group-tag').length || 1);
+
+    // Single source of truth for the flex layout. tagWidth is the tag's own
+    // width; gap is the space BETWEEN tags. Keeping them separate lets the row
+    // capacity use the real packing rule below.
+    const gap = VIRTUAL_POLICY.groupTagGap;
+    let tagWidth = VIRTUAL_POLICY.groupTagWidth;
+    let rowHeight = VIRTUAL_POLICY.fallbackTagHeight;
+    let measured = false;
+
+    // Measure up to three tags and take the widest. All tags now share a fixed
+    // width, but a real measurement still protects against font/zoom changes
+    // and keeps the fallback path honest.
+    const tags = host.querySelectorAll('.group-tag');
+    if (tags.length > 0) {
+      let maxW = 0;
+      let maxH = 0;
+      const sample = Math.min(3, tags.length);
+      for (let i = 0; i < sample; i++) {
+        const r = this.rectOf(tags[i]);
+        if (r.width > maxW) maxW = r.width;
+        if (r.height > maxH) maxH = r.height;
+      }
+      if (maxW > 0) {
+        tagWidth = maxW;
+        measured = true;
+      }
+      if (maxH > 0) rowHeight = maxH + gap;
+    }
+
+    // itemWidth remains the pitch used by the spacer/geometry consumers:
+    // one tag plus the gap that separates it from the next tag.
+    const itemWidth = tagWidth + gap;
+    const availWidth = host.clientWidth || (this.viewportWidth() - 80);
+
+    // Flexbox fits N tags when N*tagWidth + (N-1)*gap <= availWidth, i.e.
+    // N*(tagWidth+gap) <= availWidth + gap. Adding the gap back is what makes
+    // 334px fit three 106px tags with 8px gaps (3*106 + 2*8 = 334).
+    const itemsPerRow = Math.max(1,
+      Math.floor((availWidth + gap) / (tagWidth + gap)));
+
+    const geom = {
+      itemWidth,
+      tagWidth,
+      gap,
+      rowHeight,
+      itemsPerRow,
+      totalRows: Math.max(1, Math.ceil(total / itemsPerRow)),
+      measured,
+    };
+    host.__geom = geom;
+    return geom;
+  }
+
+  getCellGeometry(grid) {
+    const cached = grid.__geom;
+    if (cached && cached.measured) return cached;
+
+    const first = grid.querySelector('.subdiv-cell-wrap');
+    let itemWidth = VIRTUAL_POLICY.fallbackCellWidth;
+    let measured = false;
+    if (first) {
+      const r = this.rectOf(first);
+      if (r.width > 0) {
+        itemWidth = r.width + 2; // flex gap
+        measured = true;
+      }
+    }
+    const geom = { itemWidth, measured };
+    grid.__geom = geom;
+    return geom;
+  }
+
+  // Drop cached geometry so the next mount re-measures. Called when a
+  // container's real size changes (window resize, responsive breakpoint).
+  invalidateLayerGeometry(layerId) {
+    const card = document.getElementById(layerId);
+    if (!card) return;
+    const tagsHost = card.querySelector('.groups-tags-list');
+    if (tagsHost) tagsHost.__geom = null;
+    const grid = card.querySelector('.subdivision-grid');
+    if (grid) grid.__geom = null;
+  }
+
+  // Observe the two virtual hosts of one layer. Recreated whenever the detail
+  // DOM is rebuilt; torn down when the layer collapses or is removed.
+  //
+  // The callback only reacts to a change in the HOST's own width: mounting more
+  // tags changes the host's height, and reacting to that would re-trigger the
+  // observer forever. Width is what determines wrapping, so it is the signal
+  // worth invalidation on.
+  attachLayerVirtualObserver(layer, card) {
+    this.detachLayerVirtualObserver(layer.id);
+    if (typeof ResizeObserver !== 'function') return;
+
+    const tagsHost = card.querySelector('.groups-tags-list');
+    const wrap = card.querySelector('.subdivision-scroll-wrap');
+    if (!tagsHost && !wrap) return;
+
+    const lastWidths = new Map();
+
+    const observer = new ResizeObserver((entries) => {
+      let groupWidthChanged = false;
+      let cellWidthChanged = false;
+      for (const entry of entries) {
+        const box = entry.contentRect || {};
+        const width = Math.round(box.width || 0);
+        const prev = lastWidths.get(entry.target);
+        if (prev === undefined) {
+          lastWidths.set(entry.target, width);
+          continue;
+        }
+        if (width === prev) continue;
+        lastWidths.set(entry.target, width);
+        if (tagsHost && entry.target === tagsHost) groupWidthChanged = true;
+        if (wrap && entry.target === wrap) cellWidthChanged = true;
+      }
+      if (!groupWidthChanged && !cellWidthChanged) return;
+      this.invalidateLayerGeometry(layer.id);
+      const target = groupWidthChanged && cellWidthChanged
+        ? 'both'
+        : (groupWidthChanged ? 'groups' : 'cells');
+      this.scheduleVirtualRefresh(layer.id, target);
+    });
+
+    if (tagsHost) observer.observe(tagsHost);
+    if (wrap) observer.observe(wrap);
+
+    this.virtualObservers.set(layer.id, observer);
+  }
+
+  detachLayerVirtualObserver(layerId) {
+    const observer = this.virtualObservers.get(layerId);
+    if (observer) {
+      try { observer.disconnect(); } catch (e) { /* already gone */ }
+      this.virtualObservers.delete(layerId);
+    }
+    const scheduled = this.virtualRefreshQueued.get(layerId);
+    if (scheduled !== undefined) {
+      this.virtualRefreshQueued.delete(layerId);
+    }
+  }
+
+  // Coalesce many resize/scroll signals into one rAF-batched remount per layer.
+  // `target` narrows the work: 'both' (default), 'groups' or 'cells'. Horizontal
+  // pattern scrolling asks for 'cells' only, so the group tags are never
+  // rebuilt by a sideways scroll.
+  scheduleVirtualRefresh(layerId, target = 'both') {
+    const existing = this.virtualRefreshQueued.get(layerId);
+    if (existing) {
+      // Widen a pending narrow refresh rather than queueing a second one.
+      if (existing !== target) this.virtualRefreshQueued.set(layerId, 'both');
+      return;
+    }
+    this.virtualRefreshQueued.set(layerId, target);
+
+    const run = () => {
+      const what = this.virtualRefreshQueued.get(layerId) || 'both';
+      this.virtualRefreshQueued.delete(layerId);
+      this.refreshLayerVirtualWindows(layerId, what);
+    };
+
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(run);
+    } else {
+      setTimeout(run, VIRTUAL_POLICY.scrollSettleMs);
+    }
+  }
+
+  refreshLayerVirtualWindows(layerId, target = 'both') {
+    const layer = this.state.layers.find((l) => l.id === layerId);
+    if (!layer || !this.isLayerExpanded(layerId)) return;
+    const card = document.getElementById(layerId);
+    if (!card) return;
+
+    // Rebinding destroys the nodes that currently hold focus. Capture the
+    // logical identity first, and restore it afterwards ONLY for the
+    // collection whose DOM was actually replaced. A no-op refresh (same
+    // signature) must not re-assign value or call focus() on a live input:
+    // that would disturb the caret and any IME composition in progress.
+    const focus = this.captureVirtualFocus(card);
+
+    let groupsRebuilt = false;
+    let cellsRebuilt = false;
+    if (target !== 'cells') groupsRebuilt = this.mountGroupWindow(layer, card);
+    if (target !== 'groups') cellsRebuilt = this.mountCellWindow(layer, card);
+
+    if (!focus) return;
+    const focusInGroups = focus.kind === 'group-input' || focus.kind === 'group-button';
+    if ((focusInGroups && groupsRebuilt) || (!focusInGroups && cellsRebuilt)) {
+      this.restoreVirtualFocus(layer, card, focus);
+    }
+  }
+
+  // --- Uncommitted Group input drafts ------------------------------------
+  //
+  // A draft is a raw DOM string the user has typed but not committed with a
+  // `change` event. It must survive off-screen virtualisation (which destroys
+  // every Group node) without ever being written into the committed
+  // layer.groups state, and without leaking into presets / share links.
+  // Drafts are keyed by a stable per-group id, not by array index.
+
+  // Keep the parallel __groupIds array aligned with layer.groups after a
+  // structural change that replaced the whole array. Also drops drafts for
+  // ids that no longer belong to this layer.
+  ensureGroupIds(layer) {
+    let ids = layer.__groupIds;
+    if (!Array.isArray(ids)) {
+      ids = [];
+      Object.defineProperty(layer, '__groupIds', {
+        value: ids, writable: true, enumerable: false, configurable: true,
+      });
+      Object.defineProperty(layer, '__groupSeq', {
+        value: 0, writable: true, enumerable: false, configurable: true,
+      });
+    }
+    // Preserve ids for surviving positions; generate fresh ids for new tail
+    // entries. When the array was wholesale replaced, callers use
+    // rebuildGroupIds() instead so no stale draft is reused.
+    while (ids.length < layer.groups.length) ids.push(this.state.nextGroupId());
+    if (ids.length > layer.groups.length) ids.length = layer.groups.length;
+    return ids;
+  }
+
+  // Wholesale replacement of the grouping (auto/even/clear/meter change/preset
+  // load): every group is new, so give them all fresh ids and drop the drafts.
+  rebuildGroupIds(layer) {
+    const ids = layer.groups.map(() => this.state.nextGroupId());
+    Object.defineProperty(layer, '__groupIds', {
+      value: ids, writable: true, enumerable: false, configurable: true,
+    });
+    Object.defineProperty(layer, '__groupSeq', {
+      value: ids.length, writable: true, enumerable: false, configurable: true,
+    });
+    this.clearLayerDrafts(layer.id);
+    return ids;
+  }
+
+  groupIdAt(layer, gIdx) {
+    const ids = this.ensureGroupIds(layer);
+    return ids[gIdx];
+  }
+
+  draftsFor(layerId) {
+    // Lazily initialised: the test harness constructs the app without calling
+    // init(), so every accessor must be safe on a fresh instance.
+    if (!this.groupDrafts) this.groupDrafts = new Map();
+    if (!this.groupDrafts.has(layerId)) this.groupDrafts.set(layerId, new Map());
+    return this.groupDrafts.get(layerId);
+  }
+
+  setGroupDraft(layerId, gIdx, rawValue) {
+    const layer = this.state.layers.find((l) => l.id === layerId);
+    if (!layer || gIdx < 0 || gIdx >= layer.groups.length) return;
+    const id = this.groupIdAt(layer, gIdx);
+    if (!id) return;
+    // An empty string is still a legitimate intermediate draft; keep it.
+    this.draftsFor(layerId).set(id, String(rawValue));
+  }
+
+  getGroupDraft(layerId, gIdx) {
+    // Read-only: never create an empty per-layer map just by asking.
+    if (!this.groupDrafts || !this.groupDrafts.has(layerId)) return undefined;
+    const layer = this.state.layers.find((l) => l.id === layerId);
+    if (!layer || gIdx < 0 || gIdx >= layer.groups.length) return undefined;
+    const id = this.groupIdAt(layer, gIdx);
+    if (!id) return undefined;
+    return this.groupDrafts.get(layerId).get(id);
+  }
+
+  clearGroupDraft(layerId, gIdx) {
+    if (!this.groupDrafts || !this.groupDrafts.has(layerId)) return;
+    const layer = this.state.layers.find((l) => l.id === layerId);
+    if (!layer) return;
+    const id = this.groupIdAt(layer, gIdx);
+    if (id) this.groupDrafts.get(layerId).delete(id);
+  }
+
+  clearLayerDrafts(layerId) {
+    if (this.groupDrafts) this.groupDrafts.delete(layerId);
+  }
+
+  clearAllDrafts() {
+    if (this.groupDrafts) this.groupDrafts.clear();
+  }
+
+  // Before off-screen collapse: copy the CURRENT DOM value of every mounted
+  // Group input into the draft store, regardless of focus or whether `change`
+  // has fired. Committed values match state, so storing them is harmless; the
+  // important case is an input that differs from state.
+  saveMountedGroupDrafts(layer, card) {
+    const inputs = card.querySelectorAll('.group-tag-val');
+    for (const input of inputs) {
+      const tag = input.closest && input.closest('.group-tag');
+      if (!tag) continue;
+      const gIdx = parseInt(tag.dataset.gidx, 10);
+      if (!Number.isInteger(gIdx) || gIdx < 0 || gIdx >= layer.groups.length) continue;
+      // Only persist a value that differs from the committed state. This
+      // avoids creating drafts for untouched inputs and never overwrites one
+      // group's draft with another group's value.
+      if (String(input.value) !== String(layer.groups[gIdx])) {
+        this.setGroupDraft(layer.id, gIdx, input.value);
+      } else {
+        this.clearGroupDraft(layer.id, gIdx);
+      }
+    }
+  }
+
+  /**
+   * Describe the focused element inside a card in logical terms, so it can be
+   * found again after the window is rebuilt.
+   *
+   * Returns null when nothing inside this card holds focus — an unrelated
+   * control must never lose focus because a virtual window refreshed.
+   */
+  captureVirtualFocus(card) {
+    const doc = (typeof document !== 'undefined') ? document : null;
+    const active = doc && doc.activeElement;
+    if (!active || !card) return null;
+    if (active === card) return null;
+
+    // Only handle descendants of this card.
+    let node = active;
+    let inside = false;
+    while (node) {
+      if (node === card) { inside = true; break; }
+      node = node.parentNode;
+    }
+    if (!inside) return null;
+
+    const cell = active.closest && active.closest('.subdiv-cell');
+    if (cell) {
+      const index = parseInt(cell.dataset.index, 10);
+      if (!Number.isInteger(index)) return null;
+      return { kind: 'cell', index };
+    }
+
+    const tag = active.closest && active.closest('.group-tag');
+    if (tag) {
+      const gIdx = parseInt(tag.dataset.gidx, 10);
+      if (!Number.isInteger(gIdx)) return null;
+      if (active.classList && active.classList.contains('group-tag-val')) {
+        return {
+          kind: 'group-input',
+          gidx: gIdx,
+          value: active.value,
+          selStart: typeof active.selectionStart === 'number' ? active.selectionStart : null,
+          selEnd: typeof active.selectionEnd === 'number' ? active.selectionEnd : null,
+        };
+      }
+      const btn = active.classList && (
+        active.classList.contains('group-move-left') ? 'left'
+          : active.classList.contains('group-move-right') ? 'right'
+            : active.classList.contains('group-tag-del') ? 'del' : null
+      );
+      if (btn) return { kind: 'group-button', gidx: gIdx, button: btn };
+    }
+
+    return null;
+  }
+
+  // Focus a replacement element without letting the browser scroll an ancestor
+  // into view. Virtual-window recycling must not move the page or the pattern
+  // scroller; only explicit navigation (focusCell) and playback follow scroll.
+  focusReplacement(el) {
+    if (!el || typeof el.focus !== 'function') return;
+    try {
+      el.focus({ preventScroll: true });
+      return;
+    } catch (e) {
+      // Some engines ignore or reject the options object. Save the scroll
+      // positions that a default focus would disturb and put them back.
+    }
+    const doc = (typeof document !== 'undefined') ? document : null;
+    const win = (typeof window !== 'undefined') ? window : null;
+    const pageX = win ? win.scrollX : 0;
+    const pageY = win ? win.scrollY : 0;
+    const scroller = (function findScroller(node) {
+      let n = node && node.parentNode;
+      while (n) {
+        if (typeof n.scrollLeft === 'number' && n.classList &&
+            n.classList.contains('subdivision-scroll-wrap')) return n;
+        n = n.parentNode;
+      }
+      return null;
+    })(el);
+    const scrollerLeft = scroller ? scroller.scrollLeft : 0;
+
+    try { el.focus(); } catch (e2) { /* not focusable */ }
+
+    if (scroller && scroller.scrollLeft !== scrollerLeft) scroller.scrollLeft = scrollerLeft;
+    if (win) {
+      if (win.scrollX !== pageX || win.scrollY !== pageY) {
+        try { win.scrollTo(pageX, pageY); } catch (e3) { /* ignore */ }
+      }
+    }
+    void doc;
+  }
+
+  restoreVirtualFocus(layer, card, focus) {
+    if (focus.kind === 'cell') {
+      const cell = card.querySelector(`.subdiv-cell[data-index="${focus.index}"]`);
+      if (!cell) return;
+      this.focusReplacement(cell);
+      this.setGridCursor(layer, focus.index);
+      return;
+    }
+
+    if (focus.kind === 'group-input') {
+      const tag = this.findMountedTag(card, focus.gidx);
+      if (!tag) return;
+      const input = tag.querySelector('.group-tag-val');
+      if (!input) return;
+
+      // The DOM value can legitimately differ from state while the user is
+      // still editing (the change event has not fired yet state still holds
+      // 4 while the input shows 7). Put the UNCOMMITTED value back; the
+      // delegated change handler will validate and commit it normally later.
+      if (focus.value !== undefined && focus.value !== null) {
+        input.value = focus.value;
+      }
+      this.focusReplacement(input);
+
+      // type="number" does not support selection APIs in Chromium; only try
+      // when the browser actually exposes them, and never claim more than that.
+      if (focus.selStart !== null && typeof input.setSelectionRange === 'function') {
+        try {
+          input.setSelectionRange(focus.selStart,
+            focus.selEnd === null ? focus.selStart : focus.selEnd);
+        } catch (e) {
+          // Number inputs reject setSelectionRange in some engines.
+        }
+      }
+      return;
+    }
+
+    if (focus.kind === 'group-button') {
+      const tag = this.findMountedTag(card, focus.gidx);
+      if (!tag) return;
+      const cls = focus.button === 'left' ? '.group-move-left'
+        : focus.button === 'right' ? '.group-move-right' : '.group-tag-del';
+      const btn = tag.querySelector(cls);
+      if (btn && !btn.disabled) this.focusReplacement(btn);
+    }
+  }
+
+  // Move keyboard focus to a specific group's action button after a detail
+  // rebuild. Falls back to the Add Group button when the target index is no
+  // longer mounted (virtual window moved) or the button is disabled.
+  focusGroupAction(layer, gIdx, buttonName) {
+    const card = document.getElementById(layer.id);
+    if (!card) return;
+    const tag = this.findMountedTag(card, gIdx);
+    if (tag) {
+      const cls = buttonName === 'left' ? '.group-move-left'
+        : buttonName === 'right' ? '.group-move-right' : '.group-tag-del';
+      const btn = tag.querySelector(cls);
+      if (btn && !btn.disabled) {
+        this.focusReplacement(btn);
+        return;
+      }
+      // A boundary move button can be disabled after the swap; keep focus on
+      // an enabled button of the same group instead of dropping it.
+      const fallback = tag.querySelector('.group-tag-del') || tag.querySelector('.group-move-left');
+      if (fallback && !fallback.disabled) {
+        this.focusReplacement(fallback);
+        return;
+      }
+    }
+    const addBtn = card.querySelector('.add-group-btn');
+    if (addBtn) this.focusReplacement(addBtn);
+  }
+
+  // After deleting a group, focus a surviving neighbour's action button — or
+  // the Add Group button when that was the last group.
+  focusAfterGroupDelete(layer, removedIdx) {
+    const card = document.getElementById(layer.id);
+    if (!card) return;
+    if (layer.groups.length === 0) {
+      const addBtn = card.querySelector('.add-group-btn');
+      if (addBtn) this.focusReplacement(addBtn);
+      return;
+    }
+    const target = Math.min(removedIdx, layer.groups.length - 1);
+    this.focusGroupAction(layer, target, 'del');
+  }
+
+  findMountedTag(card, gIdx) {
+    for (const tag of card.querySelectorAll('.group-tag')) {
+      if (parseInt(tag.dataset.gidx, 10) === gIdx) return tag;
+    }
+    return null;
+  }
+
+  // Called once per animation frame while the page scrolls: refresh only the
+  // expanded layers whose virtual host is near the viewport.
+  onPageScroll() {
+    const vh = this.viewportHeight();
+    for (const layer of this.state.layers) {
+      if (!this.isLayerExpanded(layer.id)) continue;
+      const card = document.getElementById(layer.id);
+      if (!card) continue;
+
+      const r = this.rectOf(card);
+      // Far outside the viewport: shrink the layer's detail to its minimum so
+      // off-screen layers do not keep a full window mounted while scrolling.
+      // It is rebuilt the moment it comes back into range.
+      if (r.height > 0 && (r.bottom < -vh || r.top > vh * 2)) {
+        this.collapseVirtualWindow(layer.id);
+        continue;
+      }
+      this.scheduleVirtualRefresh(layer.id);
+    }
+  }
+
+  // Reduce an expanded layer's mounted detail to the smallest legal window.
+  // Used while the layer is far off-screen; state is untouched.
+  collapseVirtualWindow(layerId) {
+    const layer = this.state.layers.find((l) => l.id === layerId);
+    if (!layer || !this.isLayerExpanded(layerId)) return;
+    const card = document.getElementById(layerId);
+    if (!card) return;
+
+    const tagsHost = card.querySelector('.groups-tags-list');
+    if (tagsHost && !(tagsHost.__minimal)) {
+      // BEFORE destroying the Group DOM: persist any uncommitted input value
+      // outside the DOM, so scrolling back can show the same draft.
+      this.saveMountedGroupDrafts(layer, card);
+      tagsHost.__minimal = true;
+      this.renderMinimalGroupWindow(layer, card);
+    }
+
+    const grid = card.querySelector('.subdivision-grid');
+    if (grid && !grid.__minimal) {
+      grid.__minimal = true;
+      this.renderMinimalCellWindow(layer, card);
+    }
+  }
+
+  // Off-screen mount: reserve the full geometry with a single spacer and mount
+  // no content at all. Keeping a couple of rows mounted would multiply across
+  // 64 expanded layers; a pure spacer keeps the scroll height and width exactly
+  // while costing one node. The layer is rebuilt as soon as it scrolls back in.
+  renderMinimalGroupWindow(layer, card) {
+    const host = card.querySelector('.groups-tags-list');
+    if (!host) return;
+    const geom = this.getGroupGeometry(host, layer);
+
+    const sig = {
+      kind: 'groups-minimal',
+      start: 0,
+      end: 0,
+      geom: `${Math.round(geom.totalRows * geom.rowHeight)}`,
+      rev: layer.__dataRev || 0,
+      minimal: true,
+    };
+    if (this.windowIsCurrent(host, sig)) return;
+
+    host.innerHTML = '';
+    const spacer = document.createElement('div');
+    spacer.className = 'virtual-spacer';
+    spacer.style.height = `${geom.totalRows * geom.rowHeight}px`;
+    host.appendChild(spacer);
+
+    layer.__virtual = layer.__virtual || {};
+    layer.__virtual.groups = { start: 0, end: 0 };
+    this.markWindowCurrent(host, sig);
+  }
+
+  renderMinimalCellWindow(layer, card) {
+    const grid = card.querySelector('.subdivision-grid');
+    if (!grid) return;
+    const total = layer.numerator;
+    const geom = this.getCellGeometry(grid);
+
+    const sig = {
+      kind: 'cells-minimal',
+      start: 0,
+      end: 0,
+      geom: `${Math.round(total * geom.itemWidth)}|${total}`,
+      rev: layer.__dataRev || 0,
+      minimal: true,
+    };
+    if (this.windowIsCurrent(grid, sig)) return;
+
+    grid.innerHTML = '';
+    const spacer = document.createElement('div');
+    spacer.className = 'virtual-spacer-h';
+    spacer.style.width = `${total * geom.itemWidth}px`;
+    grid.appendChild(spacer);
+
+    layer.__virtual = layer.__virtual || {};
+    layer.__virtual.cells = { start: 0, end: 0 };
+    this.markWindowCurrent(grid, sig);
+  }
+
+  // Refresh only the cheap derived bits of a card (summary + badge), leaving
+  // grouping tags and subdivision cells untouched.
+  refreshLayerSummary(layer) {
+    const card = document.getElementById(layer.id);
+    if (!card) return;
+    const summary = card.querySelector('.layer-summary');
+    if (summary) summary.textContent = this.layerSummaryText(layer);
+    const badge = card.querySelector('.grouping-sum-badge');
+    if (badge) {
+      const text = this.groupingBadgeHtml(layer);
+      badge.textContent = text;
+      badge.classList.toggle('error', !text.includes('✓'));
+    }
+  }
+
+  // Rebuild one layer's detail without touching any other layer.
+  refreshLayerDetail(layer) {
+    const card = document.getElementById(layer.id);
+    if (!card || !this.isLayerExpanded(layer.id)) return;
+    this.renderLayerDetail(layer, card);
+    this.refreshLayerSummary(layer);
+  }
+
+  // Expand or collapse a single layer. Collapsing drops the detail DOM but
+  // keeps every value in state, so re-expanding rebuilds from the truth.
+  setLayerExpanded(layerId, expanded) {
+    const layer = this.state.layers.find((l) => l.id === layerId);
+    if (!layer) return;
+
+    const card = document.getElementById(layerId);
+    if (!card) return;
+
+    if (expanded) {
+      this.expandedLayerIds.add(layerId);
+    } else {
+      this.expandedLayerIds.delete(layerId);
+    }
+
+    card.dataset.expanded = expanded ? '1' : '0';
+    card.classList.toggle('collapsed', !expanded);
+
+    const btn = card.querySelector('.expand-btn');
+    if (btn) btn.textContent = expanded ? '▾' : '▸';
+
+    const host = card.querySelector('.layer-detail');
+    if (!host) return;
+
+    if (expanded) {
+      this.renderLayerDetail(layer, card);
+      // Expanding many layers at once (the "expand all" case) would otherwise
+      // mount full detail for every card before any scroll happened. Decide
+      // immediately whether this card is actually on screen.
+      this.settleLayerWindow(layerId, card);
+    } else {
+      // Release the detail DOM entirely; state is unaffected. The observer is
+      // torn down too, so a collapsed layer keeps no live watchers.
+      this.detachLayerVirtualObserver(layerId);
+      host.replaceChildren();
+    }
+  }
+
+  // Mount the real window when the card is near the viewport, or the pure
+  // spacer representation when it is far away.
+  settleLayerWindow(layerId, card) {
+    const r = this.rectOf(card);
+    const vh = this.viewportHeight();
+    const measurable = r.height > 0;
+
+    if (measurable) {
+      const onScreen = !(r.bottom < -vh || r.top > vh * 2);
+      if (onScreen) this.scheduleVirtualRefresh(layerId);
+      else this.collapseVirtualWindow(layerId);
+      return;
+    }
+
+    // No layout information (first paint, or a non-layout environment). Only
+    // the first few cards keep a full window; the rest fall back to spacers so
+    // a large "expand all" cannot blow up the DOM before any scroll happens.
+    const index = this.state.layers.findIndex((l) => l.id === layerId);
+    if (index >= 0 && index < 3) {
+      this.scheduleVirtualRefresh(layerId);
+    } else {
+      this.collapseVirtualWindow(layerId);
+    }
+  }
+
+  toggleLayerExpanded(layerId) {
+    this.setLayerExpanded(layerId, !this.isLayerExpanded(layerId));
   }
 
   // ==========================================================================
   // Layer Card Event Listeners
   // ==========================================================================
 
-  bindLayerCardEvents(card, layer) {
+  // Events for the always-present header controls.
+  bindLayerHeaderEvents(card, layer) {
     // Name
     const nameInput = card.querySelector('.layer-name-input');
     nameInput.addEventListener('change', (e) => {
-      layer.name = e.target.value.trim() || layer.name;
+      // Keep the stored name inside the same length normalizeName() enforces,
+      // so a saved preset round-trips without being silently truncated.
+      const next = normalizeName(e.target.value, layer.name);
+      layer.name = next;
+      e.target.value = next;
     });
 
-    // Numerator
+    // Expand / collapse this layer's detail.
+    const expandBtn = card.querySelector('.expand-btn');
+    if (expandBtn) {
+      expandBtn.addEventListener('click', () => this.toggleLayerExpanded(layer.id));
+    }
+
+    // Numerator. Changing it rebuilds the grouping, so only THIS layer's
+    // detail is refreshed — the other cards keep their DOM and state.
     const numInput = card.querySelector('.meter-num-input');
     numInput.addEventListener('change', (e) => {
-      const newNum = Math.max(1, Math.min(1024, parseInt(e.target.value, 10) || 1));
+      const newNum = clampInt(e.target.value, METRONOME_LIMITS.numerator, layer.numerator);
+      e.target.value = newNum;
       if (newNum !== layer.numerator) {
         layer.numerator = newNum;
         layer.groups = this.state.autoGroup(newNum);
         layer.overrides = {};
-        this.renderLayers();
+        this.rebuildGroupIds(layer);
+        this.refreshLayerDetail(layer);
       }
     });
 
     // Denominator
     const denInput = card.querySelector('.meter-den-input');
     denInput.addEventListener('change', (e) => {
-      const newDen = Math.max(1, Math.min(256, parseInt(e.target.value, 10) || 1));
+      const newDen = clampInt(e.target.value, METRONOME_LIMITS.denominator, layer.denominator);
       layer.denominator = newDen;
+      e.target.value = newDen;
     });
 
     // Sound selection
     const soundSelect = card.querySelector('.select-sound');
     soundSelect.addEventListener('change', (e) => {
-      layer.sound = e.target.value;
+      layer.sound = METRONOME_SOUNDS.includes(e.target.value) ? e.target.value : 'classic';
     });
 
     // Volume
     const volSlider = card.querySelector('.vol-slider');
     volSlider.addEventListener('input', (e) => {
-      layer.volume = parseFloat(e.target.value);
+      // Range inputs are visually bounded, but the stored value is what gets
+      // saved and exported — keep it inside the shared limits regardless.
+      layer.volume = clampNumber(e.target.value, METRONOME_LIMITS.volume, layer.volume);
     });
 
     // Accent Volume
     const accSlider = card.querySelector('.accent-slider');
     accSlider.addEventListener('input', (e) => {
-      layer.accentVolume = parseFloat(e.target.value);
+      layer.accentVolume = clampNumber(e.target.value, METRONOME_LIMITS.accentVolume, layer.accentVolume);
     });
 
     // Multiplier
     const mulInput = card.querySelector('.multiplier-input');
     mulInput.addEventListener('change', (e) => {
-      layer.bpmMultiplier = Math.max(0.1, Math.min(8.0, parseFloat(e.target.value) || 1.0));
+      const next = clampNumber(e.target.value, METRONOME_LIMITS.bpmMultiplier, layer.bpmMultiplier);
+      layer.bpmMultiplier = next;
+      e.target.value = next;
     });
 
     // Mute toggle
@@ -1060,19 +3086,24 @@ class MetronomeApp {
     if (delBtn) {
       delBtn.addEventListener('click', () => {
         if (this.state.layers.length > 1) {
-          this.state.layers = this.state.layers.filter((l) => l.id !== layer.id);
-          this.renderLayers();
+          this.removeLayer(layer.id);
         }
       });
     }
+  }
 
+  // Events for the expandable detail (grouping tags + subdivision grid).
+  // Rewired every time the detail DOM is rebuilt, and never registered on
+  // collapsed cards because their detail is empty.
+  bindLayerDetailEvents(card, layer) {
     // --- Grouping Operations ---
 
     // Auto Group
     card.querySelector('.btn-auto-group').addEventListener('click', () => {
       layer.groups = this.state.autoGroup(layer.numerator);
       layer.overrides = {};
-      this.renderLayers();
+      this.rebuildGroupIds(layer);
+      this.refreshLayerDetail(layer);
     });
 
     // Even Group
@@ -1080,9 +3111,14 @@ class MetronomeApp {
       const count = Math.max(1, layer.groups.length);
       const base = Math.floor(layer.numerator / count);
       const rem = layer.numerator % count;
-      layer.groups = Array.from({ length: count }, (_, i) => base + (i < rem ? 1 : 0));
+      // When there are more groups than beats, base is 0 — clamp so the
+      // result stays inside the range normalizeGroups() accepts.
+      layer.groups = Array.from({ length: count }, (_, i) =>
+        clampGroupValue(base + (i < rem ? 1 : 0))
+      );
       layer.overrides = {};
-      this.renderLayers();
+      this.rebuildGroupIds(layer);
+      this.refreshLayerDetail(layer);
     });
 
     // Group Starts Accent
@@ -1096,87 +3132,162 @@ class MetronomeApp {
         }
         pos += size;
       });
-      this.renderLayers();
+      this.refreshLayerDetail(layer);
     });
 
     // Clear Grouping
     card.querySelector('.btn-clear-group').addEventListener('click', () => {
       layer.groups = [];
-      this.renderLayers();
+      this.rebuildGroupIds(layer);
+      this.refreshLayerDetail(layer);
     });
 
     // Add Group
     card.querySelector('.add-group-btn').addEventListener('click', () => {
+      // maxGroupEntries is a per-layer limit: normalizeGroups() receives one
+      // layer's groups array, so the UI must count the same array.
+      if (layer.groups.length >= METRONOME_LIMITS.maxGroupEntries) {
+        this.showToast(`该 Layer 的分组数量已达上限 (${METRONOME_LIMITS.maxGroupEntries})。`);
+        return;
+      }
+
       const currentSum = layer.groups.reduce((a, b) => a + b, 0);
       const remaining = Math.max(1, layer.numerator - currentSum);
-      layer.groups.push(remaining > 0 ? remaining : 2);
-      this.renderLayers();
+      layer.groups.push(clampGroupValue(remaining > 0 ? remaining : 2));
+      // ensureGroupIds() generates a fresh stable id for the new tail entry;
+      // existing drafts keep their ids and are untouched.
+      this.ensureGroupIds(layer);
+      this.refreshLayerDetail(layer);
     });
 
-    // Group items: values, delete, re-order
-    card.querySelectorAll('.group-tag').forEach((tagEl) => {
-      const gIdx = parseInt(tagEl.dataset.gidx, 10);
+    // Group tag interactions are delegated to the two stable containers, so a
+    // 1024-group layer costs 1 listener instead of ~4000. The index is read
+    // from the DOM at click time, which keeps it correct after edits.
+    const tagsContainer = card.querySelector('.groups-tags-container');
+    if (tagsContainer && !tagsContainer.dataset.bound) {
+      tagsContainer.dataset.bound = '1';
 
-      // Value change
-      const valInput = tagEl.querySelector('.group-tag-val');
-      valInput.addEventListener('change', (e) => {
-        const val = Math.max(1, parseInt(e.target.value, 10) || 1);
+      // Every keystroke updates the runtime draft only. The committed
+      // layer.groups value stays untouched until `change` fires, so a page
+      // scroll that collapses this layer cannot lose what is being typed.
+      tagsContainer.addEventListener('input', (e) => {
+        const input = e.target.closest('.group-tag-val');
+        if (!input) return;
+        const tag = input.closest('.group-tag');
+        if (!tag) return;
+        const gIdx = parseInt(tag.dataset.gidx, 10);
+        if (!Number.isInteger(gIdx)) return;
+        this.setGroupDraft(layer.id, gIdx, input.value);
+      });
+
+      tagsContainer.addEventListener('change', (e) => {
+        const input = e.target.closest('.group-tag-val');
+        if (!input) return;
+        const tag = input.closest('.group-tag');
+        if (!tag) return;
+        const gIdx = parseInt(tag.dataset.gidx, 10);
+        if (!Number.isInteger(gIdx)) return;
+
+        const val = clampGroupValue(input.value);
         layer.groups[gIdx] = val;
-        this.renderLayers();
+        input.value = val;
+        // Committed: the draft is no longer needed.
+        this.clearGroupDraft(layer.id, gIdx);
+
+        // Only the derived summary changes; the group list itself is correct
+        // in place, so the tags are NOT rebuilt here.
+        this.refreshLayerSummary(layer);
+        this.refreshSubdivisionTypes(layer);
       });
 
-      // Delete
-      tagEl.querySelector('.group-tag-del').addEventListener('click', () => {
-        layer.groups.splice(gIdx, 1);
-        this.renderLayers();
+      tagsContainer.addEventListener('click', (e) => {
+        const btn = e.target.closest('button');
+        if (!btn) return;
+        const tag = btn.closest('.group-tag');
+        const gIdx = tag ? parseInt(tag.dataset.gidx, 10) : -1;
+
+        // These handlers rebuild the entire detail DOM, so capture a logical
+        // focus destination BEFORE the rebuild. Only act when the focused
+        // element really was the group button the user activated; an unrelated
+        // control must keep its focus.
+        const doc = (typeof document !== 'undefined') ? document : null;
+        const activatedByFocus = doc && doc.activeElement === btn;
+
+        if (btn.classList.contains('group-tag-del')) {
+          if (!Number.isInteger(gIdx)) return;
+          const ids = this.ensureGroupIds(layer);
+          const removedId = ids[gIdx];
+          layer.groups.splice(gIdx, 1);
+          ids.splice(gIdx, 1);
+          // The group no longer exists: its draft must not survive to be
+          // applied to whichever group shifts into this index.
+          if (removedId) this.draftsFor(layer.id).delete(removedId);
+          this.refreshLayerDetail(layer);
+          if (activatedByFocus) this.focusAfterGroupDelete(layer, gIdx);
+          return;
+        }
+
+        if (btn.classList.contains('group-move-left')) {
+          if (!Number.isInteger(gIdx) || gIdx <= 0) return;
+          const ids = this.ensureGroupIds(layer);
+          const temp = layer.groups[gIdx];
+          layer.groups[gIdx] = layer.groups[gIdx - 1];
+          layer.groups[gIdx - 1] = temp;
+          // Move the stable id WITH its group, so the draft follows it.
+          const idTemp = ids[gIdx];
+          ids[gIdx] = ids[gIdx - 1];
+          ids[gIdx - 1] = idTemp;
+          this.refreshLayerDetail(layer);
+          if (activatedByFocus) this.focusGroupAction(layer, gIdx - 1, 'left');
+          return;
+        }
+
+        if (btn.classList.contains('group-move-right')) {
+          if (!Number.isInteger(gIdx) || gIdx >= layer.groups.length - 1) return;
+          const ids = this.ensureGroupIds(layer);
+          const temp = layer.groups[gIdx];
+          layer.groups[gIdx] = layer.groups[gIdx + 1];
+          layer.groups[gIdx + 1] = temp;
+          const idTemp = ids[gIdx];
+          ids[gIdx] = ids[gIdx + 1];
+          ids[gIdx + 1] = idTemp;
+          this.refreshLayerDetail(layer);
+          if (activatedByFocus) this.focusGroupAction(layer, gIdx + 1, 'right');
+        }
       });
+    }
 
-      // Move Left
-      const leftBtn = tagEl.querySelector('.group-move-left');
-      if (leftBtn) {
-        leftBtn.addEventListener('click', () => {
-          if (gIdx > 0) {
-            const temp = layer.groups[gIdx];
-            layer.groups[gIdx] = layer.groups[gIdx - 1];
-            layer.groups[gIdx - 1] = temp;
-            this.renderLayers();
-          }
-        });
-      }
+    // --- Subdivision Interactive Cell Click (delegated) ---
+    const grid = card.querySelector('.subdivision-grid');
+    if (grid && !grid.dataset.bound) {
+      grid.dataset.bound = '1';
 
-      // Move Right
-      const rightBtn = tagEl.querySelector('.group-move-right');
-      if (rightBtn) {
-        rightBtn.addEventListener('click', () => {
-          if (gIdx < layer.groups.length - 1) {
-            const temp = layer.groups[gIdx];
-            layer.groups[gIdx] = layer.groups[gIdx + 1];
-            layer.groups[gIdx + 1] = temp;
-            this.renderLayers();
-          }
-        });
-      }
-    });
-
-    // --- Subdivision Interactive Cell Click ---
-    card.querySelectorAll('.subdiv-cell').forEach((cell) => {
-      cell.addEventListener('click', () => {
+      // Keep the roving-tabindex cursor in sync with real focus.
+      grid.addEventListener('focusin', (e) => {
+        const cell = e.target.closest && e.target.closest('.subdiv-cell');
+        if (!cell) return;
         const index = parseInt(cell.dataset.index, 10);
-        const currentType = this.state.getBeatType(layer, index);
-        const nextType = this.state.cycleBeatType(currentType);
-        layer.overrides[index] = nextType;
-
-        // Immediate visual update of cell
-        cell.className = `subdiv-cell ${nextType}`;
-        cell.querySelector('.cell-icon').textContent = nextType === 'accent' ? '●' : (nextType === 'mute' ? '×' : '○');
-        cell.title = `第 ${index + 1} 拍：${nextType}`;
+        if (!Number.isInteger(index)) return;
+        this.setGridCursor(layer, index);
       });
-    });
+
+      grid.addEventListener('keydown', (e) => {
+        const cell = e.target.closest && e.target.closest('.subdiv-cell');
+        if (!cell) return;
+        this.handleGridKeydown(e, layer, cell);
+      });
+
+      grid.addEventListener('click', (e) => {
+        const cell = e.target.closest('.subdiv-cell');
+        if (!cell) return;
+        this.toggleCell(layer, cell);
+      });
+    }
 
     // Pattern buttons
     card.querySelector('.btn-reset-pattern').addEventListener('click', () => {
       layer.overrides = {};
-      this.renderLayers();
+      this.refreshLayerDetail(layer);
     });
 
     card.querySelector('.btn-all-normal').addEventListener('click', () => {
@@ -1184,7 +3295,7 @@ class MetronomeApp {
       for (let i = 0; i < layer.numerator; i++) {
         layer.overrides[i] = 'normal';
       }
-      this.renderLayers();
+      this.refreshLayerDetail(layer);
     });
 
     card.querySelector('.btn-random-pattern').addEventListener('click', () => {
@@ -1193,8 +3304,45 @@ class MetronomeApp {
       for (let i = 0; i < layer.numerator; i++) {
         layer.overrides[i] = choices[Math.floor(Math.random() * choices.length)];
       }
-      this.renderLayers();
+      this.refreshLayerDetail(layer);
     });
+  }
+
+  // Repaint only the beat-type classes of the cells that are currently
+  // mounted, without rebuilding any DOM. Used after a grouping edit changes
+  // the derived accent pattern.
+  //
+  // With virtualisation the mounted cells are a contiguous slice that does not
+  // start at 0, so the index must come from data-index — never from the loop
+  // counter, which would paint the wrong beats.
+  refreshSubdivisionTypes(layer) {
+    const card = document.getElementById(layer.id);
+    if (!card) return;
+    const grid = card.querySelector('.subdivision-grid');
+    if (!grid) return;
+
+    // The beat types derived from the grouping changed, but the rendered cell
+    // range may not. Repaint in place and invalidate the cell window's
+    // signature so a later refresh cannot resurrect the old paint.
+    this.bumpLayerDataRevision(layer);
+    grid.__windowSig = null;
+
+    const starts = this.groupStartSet(layer);
+    const cells = grid.querySelectorAll('.subdiv-cell');
+    for (const cell of cells) {
+      const index = parseInt(cell.dataset.index, 10);
+      if (!Number.isInteger(index) || index < 0 || index >= layer.numerator) continue;
+
+      // One shared painter keeps class, icon, title and the ARIA attributes in
+      // step. Maintaining a second copy of this logic here is how aria-label
+      // and aria-pressed used to go stale after a grouping edit.
+      this.paintCell(cell, index, this.state.getBeatType(layer, index));
+
+      const wrapEl = cell.parentElement;
+      if (wrapEl && wrapEl.classList) {
+        wrapEl.classList.toggle('group-start', starts.has(index) && index > 0);
+      }
+    }
   }
 
   // ==========================================================================
@@ -1209,8 +3357,9 @@ class MetronomeApp {
       chip.className = 'preset-chip';
       chip.innerHTML = `<button class="preset-chip-load">${this.escapeHtml(preset.name)}</button>`;
       chip.querySelector('.preset-chip-load').addEventListener('click', () => {
-        this.loadPresetData(preset);
-        this.showToast(`已加载预设：${preset.name}`);
+        if (this.loadPresetData(preset)) {
+          this.showToast(`已加载预设：${preset.name}`);
+        }
       });
       this.dom.factoryPresets.appendChild(chip);
     });
@@ -1219,13 +3368,27 @@ class MetronomeApp {
     this.renderUserPresets();
   }
 
+  // Corrupted storage must degrade to "no presets", never throw during init.
+  // Entries are returned as-is (minus structural junk) so the raw index stays
+  // usable for deletion; each preset is validated when it is loaded.
   getUserPresets() {
     try {
       const data = localStorage.getItem('polyrhythm_metronome_presets');
-      return data ? JSON.parse(data) : [];
-    } catch {
+      if (!data) return [];
+      const parsed = JSON.parse(data);
+      if (!Array.isArray(parsed)) {
+        console.warn('Ignoring preset storage: value is not an array.');
+        return [];
+      }
+      return parsed;
+    } catch (e) {
+      console.warn('Failed to read preset storage:', e);
       return [];
     }
+  }
+
+  isPresetLike(preset) {
+    return !!preset && typeof preset === 'object' && !Array.isArray(preset);
   }
 
   saveUserPresetsToStorage(presets) {
@@ -1246,23 +3409,27 @@ class MetronomeApp {
     }
 
     presets.forEach((preset, index) => {
+      const presetName = this.isPresetLike(preset) && typeof preset.name === 'string'
+        ? preset.name
+        : `Preset ${index + 1}`;
       const chip = document.createElement('div');
       chip.className = 'preset-chip';
       chip.innerHTML = `
-        <button class="preset-chip-load">${this.escapeHtml(preset.name)}</button>
+        <button class="preset-chip-load">${this.escapeHtml(presetName)}</button>
         <button class="preset-chip-del" title="删除预设">✕</button>
       `;
 
       chip.querySelector('.preset-chip-load').addEventListener('click', () => {
-        this.loadPresetData(preset);
-        this.showToast(`已加载预设：${preset.name}`);
+        if (this.loadPresetData(preset)) {
+          this.showToast(`已加载预设：${presetName}`);
+        }
       });
 
       chip.querySelector('.preset-chip-del').addEventListener('click', () => {
         const updated = this.getUserPresets().filter((_, i) => i !== index);
         this.saveUserPresetsToStorage(updated);
         this.renderUserPresets();
-        this.showToast(`已删除预设：${preset.name}`);
+        this.showToast(`已删除预设：${presetName}`);
       });
 
       this.dom.userPresets.appendChild(chip);
@@ -1270,9 +3437,8 @@ class MetronomeApp {
   }
 
   saveUserPreset(name) {
-    const presets = this.getUserPresets();
     const newPreset = {
-      name,
+      name: normalizeName(name, `Preset ${new Date().toLocaleTimeString()}`),
       bpm: this.state.bpm,
       layers: this.state.layers.map((l) => ({
         name: l.name,
@@ -1289,31 +3455,59 @@ class MetronomeApp {
       timestamp: Date.now(),
     };
 
+    // Never persist a preset the loader would refuse. This is the same
+    // validator loadPresetData() uses, so save and load cannot disagree.
+    const check = this.state.normalizeConfiguration(newPreset);
+    if (!check.ok) {
+      console.warn('Refusing to save invalid preset:', check.reason);
+      this.showToast('当前配置无法保存为预设，已保持原有预设不变。');
+      return false;
+    }
+
+    const presets = this.getUserPresets();
     presets.unshift(newPreset);
     this.saveUserPresetsToStorage(presets);
     this.renderUserPresets();
-    this.showToast(`预设「${name}」已保存到本地！`);
+    this.showToast(`预设「${newPreset.name}」已保存到本地！`);
+    return true;
   }
 
   loadPresetData(preset) {
+    // Presets use the long-form field names. Route them through the same
+    // validator as shared URLs so a hand-edited localStorage entry cannot
+    // inject NaN/Infinity or out-of-range meters into the scheduler.
+    const normalized = this.state.normalizeConfiguration(preset);
+    if (!normalized.ok) {
+      console.warn('Rejected preset:', normalized.reason, preset);
+      this.showToast('该预设数据无效，已保持当前配置。');
+      return false;
+    }
+
     const wasPlaying = this.state.isPlaying;
     if (wasPlaying) {
       this.stopPlayback();
     }
 
-    this.state.bpm = preset.bpm || 120;
-    this.state.layers = (preset.layers || []).map((l, idx) => {
-      return this.state.createLayer({
-        ...l,
-        color: this.state.getLayerColor(idx),
-      });
-    });
-
-    this.renderAll();
+    this.applyConfiguration(normalized);
 
     if (wasPlaying) {
       this.startPlayback();
     }
+    return true;
+  }
+
+  // Single place that swaps the live configuration and resets transport state.
+  // Expansion state is UI-only, so it is recomputed for the new configuration;
+  // the beat data itself is never touched by render state.
+  applyConfiguration({ bpm, layers }) {
+    this.state.bpm = bpm;
+    // The grouping data is being wholesale replaced. Any draft belongs to the
+    // OLD groups and must not be applied to the new configuration.
+    this.clearAllDrafts();
+    this.state.layers = layers;
+    this.state.clearVisualQueue();
+    this.applyInitialExpansionState();
+    this.renderAll();
   }
 
   // ==========================================================================
@@ -1340,6 +3534,21 @@ class MetronomeApp {
     try {
       const jsonStr = JSON.stringify(config);
       const encoded = btoa(encodeURIComponent(jsonStr));
+
+      // Same measurement as the import path (loadStateFromUrl compares
+      // hash.length). Checked before touching the clipboard or the URL, so an
+      // oversized config can never produce a link this app would refuse.
+      //
+      // A configuration being too large to share does NOT make it invalid: it
+      // is still a legal local configuration and can be saved as a preset.
+      // The message says so explicitly, so the two conditions are not confused.
+      if (!isPayloadWithinLimit(encoded)) {
+        this.showToast(
+          `配置过大（${encoded.length} 字符，上限 ${METRONOME_LIMITS.maxPayloadLength}），无法生成分享链接；该配置仍然有效，可保存为本地预设。`
+        );
+        return false;
+      }
+
       const url = new URL(window.location.href);
       url.hash = encoded;
 
@@ -1349,48 +3558,79 @@ class MetronomeApp {
         window.location.hash = encoded;
         this.showToast('已更新 URL Hash，可直接复制地址栏分享！');
       });
+      return true;
     } catch (e) {
       console.error('URL encode failed', e);
+      this.showToast('生成分享链接失败，请检查当前配置。');
+      return false;
     }
+  }
+
+  // Expand the compact share-link field names into the long form used by
+  // presets, so both formats meet in normalizeConfiguration(). Non-object
+  // entries are passed through untouched for the validator to reject.
+  expandUrlConfiguration(config) {
+    return {
+      bpm: config.bpm,
+      layers: config.layers.map((l) => {
+        if (l === null || typeof l !== 'object' || Array.isArray(l)) return l;
+
+        // `ov` is the compact [[index, type], ...] form; `overrides` is
+        // accepted too so older/hand-written links keep working.
+        const overrides = l.ov !== undefined ? l.ov : l.overrides;
+        return {
+          name: l.n !== undefined ? l.n : l.name,
+          numerator: l.num !== undefined ? l.num : l.numerator,
+          denominator: l.den !== undefined ? l.den : l.denominator,
+          bpmMultiplier: l.mul !== undefined ? l.mul : l.bpmMultiplier,
+          groups: l.g !== undefined ? l.g : l.groups,
+          overrides,
+          sound: l.snd !== undefined ? l.snd : l.sound,
+          volume: l.vol !== undefined ? l.vol : l.volume,
+          accentVolume: l.av !== undefined ? l.av : l.accentVolume,
+          muted: l.m !== undefined ? !!l.m : !!l.muted,
+        };
+      }),
+    };
   }
 
   loadStateFromUrl() {
     const hash = window.location.hash.slice(1);
     if (!hash) return false;
 
+    // Bound the work before decoding: a huge or malformed hash must not be
+    // able to stall or crash initialization. Shares the exact same predicate
+    // as shareConfiguration().
+    if (!isPayloadWithinLimit(hash)) {
+      console.warn('Ignoring URL config: payload too large.');
+      return false;
+    }
+
+    let config;
     try {
-      const jsonStr = decodeURIComponent(atob(hash));
-      const config = JSON.parse(jsonStr);
-
-      if (config.bpm) this.state.bpm = config.bpm;
-
-      if (Array.isArray(config.layers) && config.layers.length > 0) {
-        this.state.layers = config.layers.map((l, idx) => {
-          const overrides = {};
-          if (Array.isArray(l.ov)) {
-            l.ov.forEach(([k, v]) => { overrides[k] = v; });
-          }
-
-          return this.state.createLayer({
-            name: l.n,
-            numerator: l.num,
-            denominator: l.den,
-            bpmMultiplier: l.mul,
-            groups: l.g,
-            overrides,
-            sound: l.snd,
-            volume: l.vol,
-            accentVolume: l.av,
-            muted: !!l.m,
-            color: this.state.getLayerColor(idx),
-          });
-        });
-        return true;
-      }
+      config = JSON.parse(decodeURIComponent(atob(hash)));
     } catch (e) {
       console.warn('Failed to parse URL config:', e);
+      return false;
     }
-    return false;
+
+    if (config === null || typeof config !== 'object' || Array.isArray(config)) {
+      console.warn('Ignoring URL config: not a configuration object.');
+      return false;
+    }
+    if (!Array.isArray(config.layers)) {
+      console.warn('Ignoring URL config: missing layer array.');
+      return false;
+    }
+
+    const normalized = this.state.normalizeConfiguration(this.expandUrlConfiguration(config));
+    if (!normalized.ok) {
+      console.warn('Ignoring URL config:', normalized.reason);
+      return false;
+    }
+
+    this.applyConfiguration(normalized);
+    return true;
   }
 
   // Toast feedback
