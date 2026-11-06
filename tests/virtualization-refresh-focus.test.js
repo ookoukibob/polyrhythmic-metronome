@@ -529,23 +529,58 @@ test('draft A: an uncommitted value survives off-screen collapse and re-mount', 
 
 test('draft B: restoring a draft does not steal focus', () => {
   const { app, layer } = draftApp();
+  const card = app.document.getElementById(layer.id);
 
+  // --- Phase 1: initial edit, input mounted and focused ---
   const input = firstInput(app, layer.id);
-  input.value = '7';
+  assert.equal(String(layer.groups[0]), '4', 'committed state starts at 4');
   input.focus();
-  input.dispatchEvent({ type: 'input' });
+  input.value = '7';
+  input.dispatchEvent({ type: 'input' });   // NO change event
+  assert.equal(app.getGroupDraft(layer.id, 0), '7', 'draft saved');
+  assert.equal(app.document.activeElement, input, 'input is focused');
 
-  collapseAndRemount(app, layer);
+  // The mini DOM has no Element#contains, so walk the parent chain instead.
+  const isMountedIn = (node, root) => {
+    let n = node;
+    while (n) {
+      if (n === root) return true;
+      n = n.parentNode;
+    }
+    return false;
+  };
+  assert.equal(isMountedIn(input, card), true, 'the input is in the DOM before collapse');
 
-  // User moved focus elsewhere while the layer was off-screen.
+  // --- Phase 2: COLLAPSE ONLY. No re-mount helper is called here. ---
+  app.collapseVirtualWindow(layer.id);
+  const host = card.querySelector('.groups-tags-list');
+  assert.equal(host.__minimal, true, 'Group window is in minimal state');
+  assert.equal(tagNodes(app, layer.id).length, 0, 'all Group tags removed');
+  assert.equal(app.document.getElementById(layer.id).querySelector('.group-tag-val'), null,
+    'no Group input is mounted');
+  assert.equal(isMountedIn(input, card), false,
+    'the original input node is gone from the DOM');
+  assert.equal(String(layer.groups[0]), '4', 'committed state still 4');
+  assert.equal(app.getGroupDraft(layer.id, 0), '7', 'draft survived the collapse');
+
+  // --- Phase 3: while STILL off-screen, move focus to an unrelated control ---
   const other = app.document.createElement('button');
+  other.className = 'add-layer-btn';
   app.document.body.appendChild(other);
   other.focus();
+  assert.equal(app.document.activeElement, other, 'unrelated control now holds focus');
+  assert.equal(host.__minimal, true, 'still minimal while focus moves');
 
-  // A further refresh must keep focus on the unrelated control.
-  app.mountGroupWindow(layer, app.document.getElementById(layer.id));
-  assert.equal(firstInput(app, layer.id).value, '7', 'draft still restored');
-  assert.equal(app.document.activeElement, other, 'focus not stolen');
+  // --- Phase 4: re-mount through the normal path ---
+  app.mountGroupWindow(layer, card);
+  assert.equal(host.__minimal, false, 'Group window mounted again');
+  const again = firstInput(app, layer.id);
+  assert.notEqual(again, input, 'a new input node was created');
+  assert.equal(again.value, '7', 'restored input displays the draft');
+  assert.equal(String(layer.groups[0]), '4', 'committed state still 4');
+  assert.equal(app.getGroupDraft(layer.id, 0), '7', 'draft still uncommitted');
+  assert.equal(app.document.activeElement, other,
+    're-mounting the draft did NOT steal focus from the unrelated control');
 });
 
 test('draft C: a restored draft commits normally and is then cleared', () => {
